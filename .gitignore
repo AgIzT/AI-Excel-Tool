@@ -1,0 +1,13 @@
+# Python 垃圾文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+env/
+
+# PyInstaller 打包生成的文件 (1.0版本里如果生成了这些，千万别传)
+build/
+dist/
+*.spec
