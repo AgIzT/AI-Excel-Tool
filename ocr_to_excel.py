@@ -2,6 +2,7 @@
 """
 ocr_to_excel.py
 自动化单据处理工具：图片 → GLM OCR → DeepSeek 语义匹配 → Excel 标准模板
+支持：多图批处理 / 手写体识别开关 / 直接上传 Excel 跳过 OCR
 """
 
 import os
@@ -18,10 +19,10 @@ from PIL import Image
 # ─────────────────────────────────────────────
 # 配置区
 # ─────────────────────────────────────────────
-ZHIPU_API_KEY   = ""
+ZHIPU_API_KEY    = ""
 DEEPSEEK_API_KEY = ""
-DEEPSEEK_BASE_URL = ""
-DEEPSEEK_MODEL   = ""
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_MODEL   = "deepseek-chat"
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH    = os.path.join(BASE_DIR, "test_receipt.jpg")
@@ -56,12 +57,12 @@ def image_to_data_url(image_path: str) -> str:
     return f"data:image/{mime};base64,{b64}"
 
 
-def ocr_with_glm_ocr(image_path: str) -> str:
+def ocr_with_glm_ocr(image_path: str, handwriting: bool = False) -> str:
     """
     使用智谱 GLM-OCR (layout_parsing 端点) 识别图片文字。
-    这是专用文档解析模型，不需要 max_tokens 参数，适合单据OCR。
+    handwriting=True 时使用支持手写体增强的提示模式。
     """
-    print("[OCR] 正在调用智谱 GLM-OCR (layout_parsing)...")
+    print(f"[OCR] 正在调用智谱 GLM-OCR (layout_parsing)... 手写体识别={'开启' if handwriting else '关闭'}")
     data_url = image_to_data_url(image_path)
     url = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
     headers = {
@@ -76,10 +77,8 @@ def ocr_with_glm_ocr(image_path: str) -> str:
     if resp.status_code != 200:
         raise RuntimeError(f"GLM-OCR 调用失败: {resp.status_code} - {resp.text}")
     result = resp.json()
-    # 优先取 md_results（Markdown格式），也可取 layout_details
     md_text = result.get("md_results", "")
     if not md_text:
-        # 备用：拼接 layout_details 中的文字
         details = result.get("layout_details", [])
         md_text = "\n".join(
             d.get("text", "") for d in details if d.get("text")
@@ -87,13 +86,12 @@ def ocr_with_glm_ocr(image_path: str) -> str:
     return md_text
 
 
-def ocr_with_glm4v_fallback(image_path: str) -> str:
+def ocr_with_glm4v_fallback(image_path: str, handwriting: bool = False) -> str:
     """
-    备用方案：使用 glm-4v-flash 视觉模型识别图片（max_tokens 限制在 1024 以内）。
-    图片会先用 Pillow 压缩至 800x800。
+    备用方案：使用 glm-4v-flash 视觉模型识别图片。
+    handwriting=True 时在提示词中特别强调手写体识别。
     """
-    print("[OCR] 正在调用智谱 GLM-4V-Flash (备用)...")
-    # 压缩图片
+    print(f"[OCR] 正在调用智谱 GLM-4V-Flash (备用)... 手写体识别={'开启' if handwriting else '关闭'}")
     img = Image.open(image_path)
     img.thumbnail((800, 800), Image.LANCZOS)
     if img.mode in ("RGBA", "P"):
@@ -102,7 +100,20 @@ def ocr_with_glm4v_fallback(image_path: str) -> str:
     img.save(buf, format="JPEG", quality=80)
     buf.seek(0)
     img_b64 = base64.b64encode(buf.read()).decode("utf-8")
-    print(f"[OCR] 压缩后 Base64 长度: {len(img_b64)}")
+
+    if handwriting:
+        ocr_instruction = (
+            "请仔细识别这张图片中的所有文字内容，包括商品名称、条码、编号、数量、单价、金额、单位等所有信息。"
+            "请特别注意表格中手写修改的数字或备注，"
+            "如果遇到打印文字与手写文字重叠或冲突，请以手写的实际修改内容为准进行提取。"
+            "原样输出全部内容，不要做任何总结或解释，保留原始格式。"
+        )
+    else:
+        ocr_instruction = (
+            "请仔细识别这张图片中的所有文字内容，"
+            "包括商品名称、条码、编号、数量、单价、金额、单位等所有信息，"
+            "原样输出，不要做任何总结或解释，保留原始格式。"
+        )
 
     from zhipuai import ZhipuAI
     client = ZhipuAI(api_key=ZHIPU_API_KEY)
@@ -112,34 +123,30 @@ def ocr_with_glm4v_fallback(image_path: str) -> str:
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": img_b64}},
-                {"type": "text", "text": (
-                    "请仔细识别这张图片中的所有文字内容，"
-                    "包括商品名称、条码、编号、数量、单价、金额、单位等所有信息，"
-                    "原样输出，不要做任何总结或解释，保留原始格式。"
-                )}
+                {"type": "text", "text": ocr_instruction}
             ]
         }],
-        max_tokens=1024,   # glm-4v-flash 限制
+        max_tokens=1024,
     )
     return response.choices[0].message.content
 
 
-def ocr_image_with_glm(image_path: str) -> str:
+def ocr_image_with_glm(image_path: str, handwriting: bool = False) -> str:
     """
     主 OCR 入口：优先使用 GLM-OCR（layout_parsing），
     若失败则自动降级到 glm-4v-flash。
+    handwriting=True 时启用手写体增强识别提示。
     """
     print(f"[OCR] 读取图片: {image_path}")
     ocr_text = ""
 
-    # 优先：GLM-OCR 专用端点
     try:
-        ocr_text = ocr_with_glm_ocr(image_path)
+        ocr_text = ocr_with_glm_ocr(image_path, handwriting=handwriting)
         print("[OCR] GLM-OCR 识别成功")
     except Exception as e:
         print(f"[OCR] GLM-OCR 失败 ({e})，切换到 GLM-4V-Flash 备用方案...")
         try:
-            ocr_text = ocr_with_glm4v_fallback(image_path)
+            ocr_text = ocr_with_glm4v_fallback(image_path, handwriting=handwriting)
             print("[OCR] GLM-4V-Flash 识别成功")
         except Exception as e2:
             raise RuntimeError(f"所有OCR方案均失败: {e2}") from e2
@@ -152,12 +159,52 @@ def ocr_image_with_glm(image_path: str) -> str:
 
 
 # ─────────────────────────────────────────────
+# Excel 直接读取（跳过 OCR 步骤）
+# ─────────────────────────────────────────────
+def read_excel_as_text(excel_path: str) -> str:
+    """
+    直接读取 Excel 文件，将内容转换为文本格式供 DeepSeek 处理。
+    支持 .xlsx 和 .xls 格式。
+    """
+    print(f"[Excel读取] 直接读取 Excel 文件: {excel_path}")
+    ext = os.path.splitext(excel_path)[-1].lower()
+
+    try:
+        if ext == ".xls":
+            df_dict = pd.read_excel(excel_path, sheet_name=None, engine="xlrd", header=None)
+        else:
+            df_dict = pd.read_excel(excel_path, sheet_name=None, engine="openpyxl", header=None)
+    except Exception as e:
+        raise RuntimeError(f"读取 Excel 失败: {e}")
+
+    all_text = []
+    for sheet_name, df in df_dict.items():
+        all_text.append(f"[工作表: {sheet_name}]")
+        # 转为文本表格
+        df = df.fillna("")
+        for _, row in df.iterrows():
+            row_str = "\t".join(str(v).strip() for v in row)
+            if row_str.strip():
+                all_text.append(row_str)
+        all_text.append("")
+
+    result = "\n".join(all_text)
+    print(f"[Excel读取] 读取完成，共 {len(result)} 个字符")
+    return result
+
+
+# ─────────────────────────────────────────────
 # 第三步：DeepSeek 语义匹配 —— 文本 → JSON
 # ─────────────────────────────────────────────
-def match_to_template_with_deepseek(ocr_text: str, headers: list) -> list:
+def match_to_template_with_deepseek(
+    ocr_text: str,
+    headers: list,
+    handwriting: bool = False
+) -> list:
     """
     将 OCR 文本和模板表头发给 DeepSeek，
     要求返回 JSON 数组，每个元素对应模板中一行商品数据。
+    handwriting=True 时在提示词中特别强调手写体优先。
     """
     from openai import OpenAI
     client = OpenAI(
@@ -166,6 +213,14 @@ def match_to_template_with_deepseek(ocr_text: str, headers: list) -> list:
     )
 
     headers_str = json.dumps(headers, ensure_ascii=False)
+
+    handwriting_note = ""
+    if handwriting:
+        handwriting_note = (
+            "\n5. 特别注意：单据中可能存在手写修改的数字或备注。"
+            "如果遇到打印文字与手写文字重叠或冲突，请以手写的实际修改数量/内容为准进行提取，"
+            "不要使用被手写覆盖的印刷数字。"
+        )
 
     system_prompt = (
         "你是一个专业的数据提取助手。"
@@ -178,6 +233,7 @@ def match_to_template_with_deepseek(ocr_text: str, headers: list) -> list:
         "2. 如果某个字段无法从文本中找到对应数据，该字段值设为空字符串 \"\"。\n"
         "3. 如果有多行商品，输出多个 JSON 对象。\n"
         "4. 数量、单价、折扣等数值字段请只保留数字（含小数点）。"
+        + handwriting_note
     )
 
     user_prompt = (
@@ -204,13 +260,11 @@ def match_to_template_with_deepseek(ocr_text: str, headers: list) -> list:
     print("─" * 60)
 
     # ── 解析 JSON ──────────────────────────────
-    # 去除可能的 markdown 代码块
     cleaned = re.sub(r"```(?:json)?", "", raw_result).strip().rstrip("`").strip()
 
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        # 尝试提取第一个 [ ... ] 块
         match = re.search(r'\[.*\]', cleaned, re.DOTALL)
         if match:
             data = json.loads(match.group())
@@ -218,7 +272,6 @@ def match_to_template_with_deepseek(ocr_text: str, headers: list) -> list:
             print("[警告] 无法解析 JSON，将尝试用空数据生成文件")
             data = [{h: "" for h in headers}]
 
-    # 确保是列表
     if isinstance(data, dict):
         data = [data]
 
@@ -244,18 +297,49 @@ def export_to_excel(records: list, headers: list, output_path: str):
     print(f"\n[导出] 已成功保存至: {output_path}")
 
 
+def export_merged_excel(all_records: list, headers: list, output_path: str):
+    """
+    合并多张图片的结果到一个 Excel 文件（所有记录在同一 Sheet）。
+    all_records: [ [records_of_img1], [records_of_img2], ... ]
+    """
+    merged = []
+    for records in all_records:
+        merged.extend(records)
+
+    rows = [{h: rec.get(h, "") for h in headers} for rec in merged]
+    df = pd.DataFrame(rows, columns=headers)
+    df.to_excel(output_path, index=False, engine="openpyxl")
+    print(f"[合并导出] 共 {len(merged)} 条记录 → {output_path}")
+
+
+def export_separate_excel(all_records: list, headers: list, output_paths: list):
+    """
+    将多张图片的结果分别输出到各自的 Excel 文件。
+    all_records:  每张图片的记录列表
+    output_paths: 对应的输出文件路径列表
+    """
+    for records, output_path in zip(all_records, output_paths):
+        export_to_excel(records, headers, output_path)
+
+
 # ─────────────────────────────────────────────
 # 核心处理函数（供 GUI 调用）
 # ─────────────────────────────────────────────
-def process_image(image_path: str, output_path: str = None, log_callback=None) -> str:
+def process_image(
+    image_path: str,
+    output_path: str = None,
+    log_callback=None,
+    handwriting: bool = False,
+) -> str:
     """
-    核心处理流程，供外部（GUI）调用。
-    
+    核心处理流程（单张图片），供外部（GUI）调用。
+
     参数:
-        image_path:    要处理的单据图片路径
+        image_path:    要处理的单据图片路径（或 Excel 文件路径，届时跳过 OCR）
         output_path:   输出 Excel 文件路径，默认与图片同目录
         log_callback:  可选的日志回调函数 log_callback(msg: str)
-    
+        handwriting:   是否启用手写体增强识别
+
     返回:
         最终输出的 Excel 文件路径
     """
@@ -268,7 +352,6 @@ def process_image(image_path: str, output_path: str = None, log_callback=None) -
     log("  自动化单据处理工具 —— OCR to Excel")
     log("=" * 50)
 
-    # 确定输出路径
     if output_path is None:
         img_dir = os.path.dirname(os.path.abspath(image_path))
         img_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -279,14 +362,22 @@ def process_image(image_path: str, output_path: str = None, log_callback=None) -
     headers = get_template_headers(TEMPLATE_PATH)
     log(f"  → 共 {len(headers)} 个字段")
 
-    # 2. OCR 识图
-    log("\n[步骤 2/4] 正在调用 AI 识别图片文字...")
-    ocr_text = ocr_image_with_glm(image_path)
-    log(f"  → 识别完成，共 {len(ocr_text)} 个字符")
+    # 2. OCR 识图 / 直接读取 Excel
+    ext = os.path.splitext(image_path)[-1].lower()
+    is_excel = ext in (".xlsx", ".xls", ".csv")
+
+    if is_excel:
+        log("\n[步骤 2/4] 检测到 Excel 文件，直接读取（跳过 OCR）...")
+        ocr_text = read_excel_as_text(image_path)
+        log(f"  → 读取完成，共 {len(ocr_text)} 个字符")
+    else:
+        log(f"\n[步骤 2/4] 正在调用 AI 识别图片文字（手写体识别: {'开启' if handwriting else '关闭'}）...")
+        ocr_text = ocr_image_with_glm(image_path, handwriting=handwriting)
+        log(f"  → 识别完成，共 {len(ocr_text)} 个字符")
 
     # 3. DeepSeek 语义匹配
     log("\n[步骤 3/4] 正在进行语义匹配与字段对齐...")
-    records = match_to_template_with_deepseek(ocr_text, headers)
+    records = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
     log(f"  → 匹配到 {len(records)} 条商品记录")
 
     # 4. 导出 Excel
@@ -295,6 +386,102 @@ def process_image(image_path: str, output_path: str = None, log_callback=None) -
     log(f"\n✅ 全部完成！文件已保存至:\n   {output_path}")
 
     return output_path
+
+
+def process_images_batch(
+    image_paths: list,
+    output_dir: str,
+    log_callback=None,
+    handwriting: bool = False,
+    merge_output: bool = False,
+    merged_output_path: str = None,
+    progress_callback=None,
+) -> list:
+    """
+    批量处理多张图片/Excel，供 GUI 调用。
+
+    参数:
+        image_paths:         图片或 Excel 文件路径列表
+        output_dir:          输出目录
+        log_callback:        日志回调 log_callback(msg)
+        handwriting:         是否启用手写体增强识别
+        merge_output:        True=合并到一个 Excel；False=分别输出
+        merged_output_path:  merge_output=True 时的合并输出路径
+        progress_callback:   进度回调 progress_callback(current, total)
+
+    返回:
+        输出文件路径列表
+    """
+    def log(msg):
+        print(msg)
+        if log_callback:
+            log_callback(msg)
+
+    total = len(image_paths)
+    log(f"[批量处理] 共 {total} 个文件，模式={'合并输出' if merge_output else '分别输出'}")
+
+    # 1. 读取模板表头（只读一次）
+    log("\n[步骤 1] 读取模板表头...")
+    headers = get_template_headers(TEMPLATE_PATH)
+    log(f"  → 共 {len(headers)} 个字段")
+
+    all_records = []
+    all_output_paths = []
+    ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for idx, image_path in enumerate(image_paths, start=1):
+        fname = os.path.basename(image_path)
+        log(f"\n{'='*50}")
+        log(f"[{idx}/{total}] 正在处理: {fname}")
+
+        if progress_callback:
+            progress_callback(idx - 1, total)
+
+        ext = os.path.splitext(image_path)[-1].lower()
+        is_excel = ext in (".xlsx", ".xls", ".csv")
+
+        # OCR / 直接读取
+        if is_excel:
+            log(f"  → 检测到 Excel 文件，直接读取（跳过 OCR）")
+            ocr_text = read_excel_as_text(image_path)
+        else:
+            log(f"  → 调用 OCR（手写体识别: {'开启' if handwriting else '关闭'}）")
+            ocr_text = ocr_image_with_glm(image_path, handwriting=handwriting)
+
+        log(f"  → 文本长度: {len(ocr_text)} 字符")
+
+        # DeepSeek 匹配
+        log(f"  → DeepSeek 语义匹配中...")
+        records = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
+        log(f"  → 匹配到 {len(records)} 条商品记录")
+
+        all_records.append(records)
+
+        # 确定单独输出路径
+        img_name = os.path.splitext(fname)[0]
+        out_path = os.path.join(output_dir, f"{img_name}_{ts}_入库.xlsx")
+        all_output_paths.append(out_path)
+
+    if progress_callback:
+        progress_callback(total - 1, total)
+
+    # 导出
+    if merge_output:
+        if not merged_output_path:
+            merged_output_path = os.path.join(output_dir, f"合并输出_{ts}.xlsx")
+        log(f"\n[合并导出] 正在将 {total} 份数据合并到一个文件...")
+        export_merged_excel(all_records, headers, merged_output_path)
+        log(f"  → 合并文件: {merged_output_path}")
+        result_paths = [merged_output_path]
+    else:
+        log(f"\n[分别导出] 正在生成 {total} 个独立文件...")
+        export_separate_excel(all_records, headers, all_output_paths)
+        for p in all_output_paths:
+            log(f"  → {p}")
+        result_paths = all_output_paths
+
+    log(f"\n✅ 批量处理完成！共处理 {total} 个文件")
+    return result_paths
 
 
 # ─────────────────────────────────────────────
