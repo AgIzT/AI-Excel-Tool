@@ -11,7 +11,7 @@
 > 解决手工录单自动化。支持多张单据一键拖入，AI 自动提取信息并匹配导出自定义模板 Excel 表格。
 
 
-
+\---
 ## 🛠️ 快速上手
 
 1. **下载运行**：前往 [Releases](https://github.com/AgIzT/AI-Excel-Tool/releases) 下载最新的 `default.exe`。
