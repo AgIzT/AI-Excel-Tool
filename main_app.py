@@ -32,6 +32,17 @@ ctk.set_default_color_theme("blue")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 将项目目录提前加入 sys.path，兼容"直接运行 .py"和"PyInstaller EXE"两种模式。
+# PyInstaller 打包时需要在模块顶层看到静态引用才会将 ocr_to_excel 打进包。
+_meipass = getattr(sys, "_MEIPASS", None)
+for _p in filter(None, [_meipass, BASE_DIR]):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# 静态引用：让 PyInstaller 依赖分析能发现并打包 ocr_to_excel / template_manager
+from ocr_to_excel import process_images_batch as _ocr_process_batch      # noqa: E402
+from template_manager import TemplateManager as _TemplateManager          # noqa: E402
+
 # ─────────────────────────────────────────────
 # 颜色 & 字体常量
 # ─────────────────────────────────────────────
@@ -72,9 +83,13 @@ class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
         self.output_excel_paths: list = []
         self.is_processing = False
 
+        # 模板管理器
+        self.template_manager = _TemplateManager(BASE_DIR)
+
         # 选项变量
         self.handwriting_var = ctk.BooleanVar(value=False)
         self.merge_var       = ctk.BooleanVar(value=False)
+        self.template_var    = ctk.StringVar(value=self.template_manager.get_default_name())
 
         self._build_window()
         self._build_layout()
@@ -157,7 +172,7 @@ class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
 
         self._section_label(left, "⚙  操作控制台")
 
-        steps_frame = ctk.CTkScrollableFrame(left, fg_color="transparent")
+        self.steps_frame = steps_frame = ctk.CTkScrollableFrame(left, fg_color="transparent")
         steps_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
 
         # ── 步骤 1：选择文件（多选 + 拖拽）──────
@@ -242,6 +257,9 @@ class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
 
         opt_frame = ctk.CTkFrame(steps_frame, fg_color=CLR_CARD2, corner_radius=10)
         opt_frame.pack(fill="x", pady=(0, 8))
+
+        # ── 模板选择 ──────────────────────────
+        self._build_template_selector(opt_frame)
 
         # 手写体识别开关
         hw_row = ctk.CTkFrame(opt_frame, fg_color="transparent")
@@ -465,6 +483,91 @@ class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
             int(r * factor), int(g * factor), int(b * factor)
         )
 
+    # ── 模板选择器 UI ────────────────────────────
+    def _build_template_selector(self, parent):
+        """模板下拉选择行 + 添加自定义模板按钮"""
+        tpl_row = ctk.CTkFrame(parent, fg_color="transparent")
+        tpl_row.pack(fill="x", padx=14, pady=(10, 2))
+
+        ctk.CTkLabel(
+            tpl_row, text="📋  导出模板",
+            font=FONT_BODY, text_color=CLR_TEXT, anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+
+        names = self.template_manager.get_template_names()
+        if not names:
+            names = ["（无可用模板）"]
+
+        self.template_menu = ctk.CTkOptionMenu(
+            tpl_row,
+            values=names,
+            variable=self.template_var,
+            font=FONT_SMALL,
+            width=168, height=28,
+            fg_color=CLR_CARD,
+            button_color=CLR_ACCENT,
+            button_hover_color=self._darken(CLR_ACCENT),
+            dropdown_fg_color=CLR_CARD2,
+            dropdown_text_color=CLR_TEXT,
+            text_color=CLR_TEXT,
+            command=self._on_template_change,
+        )
+        self.template_menu.pack(side="right")
+
+        # 添加自定义模板按钮（右对齐，轻量样式）
+        add_row = ctk.CTkFrame(parent, fg_color="transparent")
+        add_row.pack(fill="x", padx=14, pady=(2, 8))
+
+        ctk.CTkButton(
+            add_row, text="＋  添加自定义模板",
+            font=FONT_SMALL, height=22, width=140,
+            fg_color="transparent", hover_color=CLR_CARD,
+            text_color=CLR_ACCENT, corner_radius=4,
+            command=self._on_add_custom_template,
+        ).pack(side="right")
+
+        # 分隔线
+        ctk.CTkFrame(parent, fg_color=CLR_BORDER, height=1).pack(
+            fill="x", padx=14, pady=(0, 4)
+        )
+
+    def _on_template_change(self, name: str):
+        """模板下拉切换回调"""
+        self._log(f"[模板] 已切换到：{name}", color="info")
+        self._set_status(f"模板：{name}", color=CLR_TEXT_DIM)
+
+    def _on_add_custom_template(self):
+        """添加自定义模板：弹出文件对话框，保存到 TemplateManager"""
+        path = filedialog.askopenfilename(
+            title="选择自定义模板文件",
+            filetypes=[
+                ("Excel 模板", "*.xls *.xlsx"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        name = os.path.splitext(os.path.basename(path))[0]
+        existing = self.template_manager.get_all_templates()
+        if name in existing:
+            if not messagebox.askyesno(
+                "重复模板", f"已存在同名模板「{name}」，是否覆盖？"
+            ):
+                return
+
+        try:
+            self.template_manager.add_custom_template(name, path)
+        except Exception as e:
+            messagebox.showerror("添加失败", str(e))
+            return
+
+        names = self.template_manager.get_template_names()
+        self.template_menu.configure(values=names)
+        self.template_var.set(name)
+        self._log(f"[模板] 已添加自定义模板：{name}", color="success")
+        messagebox.showinfo("添加成功", f"自定义模板「{name}」已添加！\n下次启动后仍会保留。")
+
     # ─────────────────────────────────────────────
     # 拖拽注册
     # ─────────────────────────────────────────────
@@ -599,6 +702,7 @@ class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
                 text_color=CLR_SUCCESS,
             )
 
+
     def _remove_file(self, path: str):
         """从列表中移除单个文件"""
         if path in self.selected_files:
@@ -651,18 +755,24 @@ class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
     def _run_batch_process(self):
         """后台批量处理线程"""
         try:
-            sys.path.insert(0, BASE_DIR)
-            from ocr_to_excel import process_images_batch
+            process_images_batch = _ocr_process_batch
 
-            files      = list(self.selected_files)
-            total      = len(files)
+            files       = list(self.selected_files)
+            total       = len(files)
             handwriting = self.handwriting_var.get()
             merge       = self.merge_var.get()
 
+            # 获取当前选中的模板路径
+            tpl_name = self.template_var.get()
+            try:
+                tpl_path = self.template_manager.get_template_path(tpl_name)
+            except Exception:
+                tpl_path = None   # 回退到 ocr_to_excel 内置默认路径
+
             # 输出目录：与第一个文件同目录
             output_dir = os.path.dirname(os.path.abspath(files[0]))
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            merged_path = os.path.join(output_dir, f"合并输出_{ts}.xlsx") if merge else None
+            # 合并路径传 None，由后端根据 AI 提取的供应商/日期智能命名
+            merged_path = None
 
             def log_cb(msg: str):
                 self.after(0, lambda m=msg: self._log(m))
@@ -681,6 +791,7 @@ class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
                 merge_output=merge,
                 merged_output_path=merged_path,
                 progress_callback=progress_cb,
+                template_path=tpl_path,
             )
 
             self.output_excel_paths = result_paths

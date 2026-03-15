@@ -15,6 +15,45 @@ import requests
 import pandas as pd
 import xlrd
 from PIL import Image
+import datetime
+
+# ─────────────────────────────────────────────
+# 文件名辅助工具
+# ─────────────────────────────────────────────
+def _sanitize_filename(name: str) -> str:
+    """移除 Windows/Linux 文件名中不允许的非法字符"""
+    return re.sub(r'[\\/:*?"<>|\n\r\t]', '', name).strip()
+
+
+def _build_smart_filename(meta: dict, output_dir: str, suffix: str = "_入库.xlsx") -> str:
+    """
+    根据 AI 提取的元信息生成智能文件名。
+    格式：YYYY-MM-DD_供应商名称_入库.xlsx
+    meta 中缺少字段时自动使用今天日期 / '未知供应商' 作为默认值。
+    同名文件已存在时追加计数后缀（如 _2）避免覆盖。
+    """
+    date_str     = (meta.get("date") or "").strip()
+    supplier_str = (meta.get("supplier") or "").strip()
+
+    if not date_str:
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    if not supplier_str:
+        supplier_str = "未知供应商"
+
+    supplier_str = _sanitize_filename(supplier_str) or "未知供应商"
+
+    base = f"{date_str}_{supplier_str}{suffix}"
+    path = os.path.join(output_dir, base)
+
+    if os.path.exists(path):
+        stem  = f"{date_str}_{supplier_str}"
+        count = 2
+        while os.path.exists(os.path.join(output_dir, f"{stem}_{count}{suffix}")):
+            count += 1
+        path = os.path.join(output_dir, f"{stem}_{count}{suffix}")
+
+    return path
+
 
 # ─────────────────────────────────────────────
 # 配置区
@@ -200,11 +239,17 @@ def match_to_template_with_deepseek(
     ocr_text: str,
     headers: list,
     handwriting: bool = False
-) -> list:
+) -> tuple:
     """
-    将 OCR 文本和模板表头发给 DeepSeek，
-    要求返回 JSON 数组，每个元素对应模板中一行商品数据。
+    将 OCR 文本和模板表头发给 DeepSeek，在同一次调用中同时提取：
+      - meta：供应商名称（supplier）和单据日期（date，格式 YYYY-MM-DD）
+      - records：按模板表头对齐的商品数据列表
+
     handwriting=True 时在提示词中特别强调手写体优先。
+
+    返回: (records: list, meta: dict)
+      meta 示例: {"supplier": "某某批发", "date": "2026-03-12"}
+      任一字段无法识别时为空字符串 ""。
     """
     from openai import OpenAI
     client = OpenAI(
@@ -217,7 +262,7 @@ def match_to_template_with_deepseek(
     handwriting_note = ""
     if handwriting:
         handwriting_note = (
-            "\n5. 特别注意：单据中可能存在手写修改的数字或备注。"
+            "\n6. 特别注意：单据中可能存在手写修改的数字或备注。"
             "如果遇到打印文字与手写文字重叠或冲突，请以手写的实际修改数量/内容为准进行提取，"
             "不要使用被手写覆盖的印刷数字。"
         )
@@ -226,23 +271,29 @@ def match_to_template_with_deepseek(
         "你是一个专业的数据提取助手。"
         "用户会给你一段从单据图片中 OCR 识别出的原始文字，"
         "以及一个 Excel 模板的表头字段列表。\n"
-        "你的任务是：严格按照表头字段，从 OCR 文本中提取所有商品数据，"
-        "并以 JSON 数组格式输出，每个元素是一个对象，键为表头字段名，值为对应数据。\n"
-        "规则：\n"
-        "1. 只输出纯 JSON，不要有任何其他说明文字、markdown 代码块标记。\n"
-        "2. 如果某个字段无法从文本中找到对应数据，该字段值设为空字符串 \"\"。\n"
-        "3. 如果有多行商品，输出多个 JSON 对象。\n"
-        "4. 数量、单价、折扣等数值字段请只保留数字（含小数点）。"
+        "你的任务是同时完成两件事：\n"
+        "① 从 OCR 文本中提取单据元信息（供应商名称、单据日期）\n"
+        "② 严格按照表头字段，从 OCR 文本中提取所有商品数据\n\n"
+        "输出规则：\n"
+        "1. 只输出一个纯 JSON 对象，不要有任何其他说明文字或 markdown 代码块标记。\n"
+        "2. JSON 必须包含两个顶层键：\n"
+        "   \"meta\"：{\"supplier\": \"供应商或卖方名称\", \"date\": \"YYYY-MM-DD\"}\n"
+        "   \"records\"：[商品数据对象数组]\n"
+        "3. meta.supplier：单据上的供应商/卖方/销售方名称（如'某某批发'、'XX贸易公司'），"
+        "找不到时为空字符串。\n"
+        "4. meta.date：单据日期，格式严格为 YYYY-MM-DD（如 \"2026-03-12\"），找不到时为空字符串。\n"
+        "5. records 中每个对象的键为模板表头字段名，值为对应数据；"
+        "找不到对应数据时值为空字符串；数量、单价、折扣等数值字段只保留数字（含小数点）。"
         + handwriting_note
     )
 
     user_prompt = (
         f"模板表头字段：{headers_str}\n\n"
         f"OCR 识别到的单据文本：\n{ocr_text}\n\n"
-        "请提取所有商品数据并严格按 JSON 数组格式输出。"
+        "请提取供应商名称、单据日期及所有商品数据，按指定 JSON 格式输出。"
     )
 
-    print("[DeepSeek] 正在进行语义匹配...")
+    print("[DeepSeek] 正在进行语义匹配（含供应商/日期提取）...")
     response = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=[
@@ -262,21 +313,53 @@ def match_to_template_with_deepseek(
     # ── 解析 JSON ──────────────────────────────
     cleaned = re.sub(r"```(?:json)?", "", raw_result).strip().rstrip("`").strip()
 
+    meta   = {"supplier": "", "date": ""}
+    parsed = None
+
     try:
-        data = json.loads(cleaned)
+        parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-        else:
-            print("[警告] 无法解析 JSON，将尝试用空数据生成文件")
-            data = [{h: "" for h in headers}]
+        # 先尝试提取最外层 {...}
+        m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+        # 再尝试兼容旧式纯数组 [...]
+        if parsed is None:
+            m = re.search(r'\[.*\]', cleaned, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                except json.JSONDecodeError:
+                    pass
 
-    if isinstance(data, dict):
-        data = [data]
+    if parsed is None:
+        print("[警告] 无法解析 JSON，将用空数据生成文件")
+        data = [{h: "" for h in headers}]
+    elif isinstance(parsed, dict) and "records" in parsed:
+        raw_meta = parsed.get("meta") or {}
+        meta["supplier"] = str(raw_meta.get("supplier") or "").strip()
+        meta["date"]     = str(raw_meta.get("date") or "").strip()
+        data = parsed["records"]
+        if not isinstance(data, list):
+            data = [data] if isinstance(data, dict) else [{h: "" for h in headers}]
+    elif isinstance(parsed, list):
+        # 兼容：模型直接返回了数组（旧格式降级）
+        data = parsed
+    elif isinstance(parsed, dict):
+        # 兼容：模型直接返回了单条记录
+        data = [parsed]
+    else:
+        data = [{h: "" for h in headers}]
 
-    print(f"[DeepSeek] 解析到 {len(data)} 条商品记录")
-    return data
+    print(
+        f"[DeepSeek] 解析到 {len(data)} 条商品记录 | "
+        f"供应商: {meta['supplier'] or '未识别'} | "
+        f"日期: {meta['date'] or '未识别'}"
+    )
+    return data, meta
 
 
 # ─────────────────────────────────────────────
@@ -330,6 +413,7 @@ def process_image(
     output_path: str = None,
     log_callback=None,
     handwriting: bool = False,
+    template_path: str = None,
 ) -> str:
     """
     核心处理流程（单张图片），供外部（GUI）调用。
@@ -339,6 +423,7 @@ def process_image(
         output_path:   输出 Excel 文件路径，默认与图片同目录
         log_callback:  可选的日志回调函数 log_callback(msg: str)
         handwriting:   是否启用手写体增强识别
+        template_path: 模板文件路径，为 None 时使用默认进货单模板
 
     返回:
         最终输出的 Excel 文件路径
@@ -352,14 +437,14 @@ def process_image(
     log("  自动化单据处理工具 —— OCR to Excel")
     log("=" * 50)
 
-    if output_path is None:
-        img_dir = os.path.dirname(os.path.abspath(image_path))
-        img_name = os.path.splitext(os.path.basename(image_path))[0]
-        output_path = os.path.join(img_dir, f"{img_name}_输出.xlsx")
+    img_dir = os.path.dirname(os.path.abspath(image_path))
+    smart_name = output_path is None  # 需要根据 meta 智能命名
+
+    _tpl_path = template_path or TEMPLATE_PATH
 
     # 1. 读取模板表头
     log("\n[步骤 1/4] 读取模板表头...")
-    headers = get_template_headers(TEMPLATE_PATH)
+    headers = get_template_headers(_tpl_path)
     log(f"  → 共 {len(headers)} 个字段")
 
     # 2. OCR 识图 / 直接读取 Excel
@@ -375,13 +460,16 @@ def process_image(
         ocr_text = ocr_image_with_glm(image_path, handwriting=handwriting)
         log(f"  → 识别完成，共 {len(ocr_text)} 个字符")
 
-    # 3. DeepSeek 语义匹配
+    # 3. DeepSeek 语义匹配（同时提取供应商/日期）
     log("\n[步骤 3/4] 正在进行语义匹配与字段对齐...")
-    records = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
+    records, meta = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
     log(f"  → 匹配到 {len(records)} 条商品记录")
+    log(f"  → 供应商: {meta.get('supplier') or '未识别'}  |  日期: {meta.get('date') or '未识别'}")
 
     # 4. 导出 Excel
     log("\n[步骤 4/4] 正在生成 Excel 文件...")
+    if smart_name:
+        output_path = _build_smart_filename(meta, img_dir)
     export_to_excel(records, headers, output_path)
     log(f"\n✅ 全部完成！文件已保存至:\n   {output_path}")
 
@@ -396,6 +484,7 @@ def process_images_batch(
     merge_output: bool = False,
     merged_output_path: str = None,
     progress_callback=None,
+    template_path: str = None,
 ) -> list:
     """
     批量处理多张图片/Excel，供 GUI 调用。
@@ -408,6 +497,7 @@ def process_images_batch(
         merge_output:        True=合并到一个 Excel；False=分别输出
         merged_output_path:  merge_output=True 时的合并输出路径
         progress_callback:   进度回调 progress_callback(current, total)
+        template_path:       模板文件路径，为 None 时使用默认进货单模板
 
     返回:
         输出文件路径列表
@@ -420,14 +510,17 @@ def process_images_batch(
     total = len(image_paths)
     log(f"[批量处理] 共 {total} 个文件，模式={'合并输出' if merge_output else '分别输出'}")
 
+    _tpl_path = template_path or TEMPLATE_PATH
+
     # 1. 读取模板表头（只读一次）
     log("\n[步骤 1] 读取模板表头...")
-    headers = get_template_headers(TEMPLATE_PATH)
+    headers = get_template_headers(_tpl_path)
     log(f"  → 共 {len(headers)} 个字段")
 
     all_records = []
+    all_metas   = []
     all_output_paths = []
-    ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for idx, image_path in enumerate(image_paths, start=1):
         fname = os.path.basename(image_path)
@@ -450,16 +543,17 @@ def process_images_batch(
 
         log(f"  → 文本长度: {len(ocr_text)} 字符")
 
-        # DeepSeek 匹配
+        # DeepSeek 匹配（同时提取供应商/日期）
         log(f"  → DeepSeek 语义匹配中...")
-        records = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
+        records, meta = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
         log(f"  → 匹配到 {len(records)} 条商品记录")
+        log(f"  → 供应商: {meta.get('supplier') or '未识别'}  |  日期: {meta.get('date') or '未识别'}")
 
         all_records.append(records)
+        all_metas.append(meta)
 
-        # 确定单独输出路径
-        img_name = os.path.splitext(fname)[0]
-        out_path = os.path.join(output_dir, f"{img_name}_{ts}_入库.xlsx")
+        # 确定单独输出路径（智能命名：日期_供应商_入库.xlsx）
+        out_path = _build_smart_filename(meta, output_dir)
         all_output_paths.append(out_path)
 
     if progress_callback:
@@ -468,7 +562,10 @@ def process_images_batch(
     # 导出
     if merge_output:
         if not merged_output_path:
-            merged_output_path = os.path.join(output_dir, f"合并输出_{ts}.xlsx")
+            first_meta = all_metas[0] if all_metas else {}
+            merged_output_path = _build_smart_filename(
+                first_meta, output_dir, suffix="_合并入库.xlsx"
+            )
         log(f"\n[合并导出] 正在将 {total} 份数据合并到一个文件...")
         export_merged_excel(all_records, headers, merged_output_path)
         log(f"  → 合并文件: {merged_output_path}")
