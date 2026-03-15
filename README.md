@@ -6,6 +6,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![PySide6](https://img.shields.io/badge/Framework-PySide6-green.svg)
 ![OCR](https://img.shields.io/badge/OCR-GLM--OCR-orange.svg)
+![LLM](https://img.shields.io/badge/LLM-GLM--5-red.svg)
 ![LLM](https://img.shields.io/badge/LLM-DeepSeek--V3-red.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
