@@ -58,15 +58,24 @@ def _build_smart_filename(meta: dict, output_dir: str, suffix: str = "_入库.xl
 # ─────────────────────────────────────────────
 # 配置区
 # ─────────────────────────────────────────────
-ZHIPU_API_KEY    = ""
-DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL   = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH    = os.path.join(BASE_DIR, "test_receipt.jpg")
 TEMPLATE_PATH = os.path.join(BASE_DIR, "进货单商品导入模板.xls")
 OUTPUT_PATH   = os.path.join(BASE_DIR, "标准输出测试.xlsx")
+
+
+def _resolve_runtime_key(explicit_key: str = "", env_names: tuple = (), display_name: str = "") -> str:
+    key = (explicit_key or "").strip()
+    if key:
+        return key
+    for env_name in env_names:
+        val = (os.getenv(env_name) or "").strip()
+        if val:
+            return val
+    raise RuntimeError(f"未配置 {display_name}，请先在设置页填写并保存")
 
 # ─────────────────────────────────────────────
 # 第一步：读取模板表头
@@ -96,7 +105,7 @@ def image_to_data_url(image_path: str) -> str:
     return f"data:image/{mime};base64,{b64}"
 
 
-def ocr_with_glm_ocr(image_path: str, handwriting: bool = False) -> str:
+def ocr_with_glm_ocr(image_path: str, handwriting: bool = False, zhipu_api_key: str = "") -> str:
     """
     使用智谱 GLM-OCR (layout_parsing 端点) 识别图片文字。
     handwriting=True 时使用支持手写体增强的提示模式。
@@ -104,8 +113,9 @@ def ocr_with_glm_ocr(image_path: str, handwriting: bool = False) -> str:
     print(f"[OCR] 正在调用智谱 GLM-OCR (layout_parsing)... 手写体识别={'开启' if handwriting else '关闭'}")
     data_url = image_to_data_url(image_path)
     url = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
+    key = _resolve_runtime_key(zhipu_api_key, ("ZHIPU_API_KEY", "GLM_API_KEY"), "GLM API Key")
     headers = {
-        "Authorization": ZHIPU_API_KEY,
+        "Authorization": key,
         "Content-Type": "application/json"
     }
     payload = {
@@ -125,7 +135,7 @@ def ocr_with_glm_ocr(image_path: str, handwriting: bool = False) -> str:
     return md_text
 
 
-def ocr_with_glm4v_fallback(image_path: str, handwriting: bool = False) -> str:
+def ocr_with_glm4v_fallback(image_path: str, handwriting: bool = False, zhipu_api_key: str = "") -> str:
     """
     备用方案：使用 glm-4v-flash 视觉模型识别图片。
     handwriting=True 时在提示词中特别强调手写体识别。
@@ -155,7 +165,8 @@ def ocr_with_glm4v_fallback(image_path: str, handwriting: bool = False) -> str:
         )
 
     from zhipuai import ZhipuAI
-    client = ZhipuAI(api_key=ZHIPU_API_KEY)
+    key = _resolve_runtime_key(zhipu_api_key, ("ZHIPU_API_KEY", "GLM_API_KEY"), "GLM API Key")
+    client = ZhipuAI(api_key=key)
     response = client.chat.completions.create(
         model="glm-4v-flash",
         messages=[{
@@ -170,7 +181,7 @@ def ocr_with_glm4v_fallback(image_path: str, handwriting: bool = False) -> str:
     return response.choices[0].message.content
 
 
-def ocr_image_with_glm(image_path: str, handwriting: bool = False) -> str:
+def ocr_image_with_glm(image_path: str, handwriting: bool = False, zhipu_api_key: str = "") -> str:
     """
     主 OCR 入口：优先使用 GLM-OCR（layout_parsing），
     若失败则自动降级到 glm-4v-flash。
@@ -180,12 +191,12 @@ def ocr_image_with_glm(image_path: str, handwriting: bool = False) -> str:
     ocr_text = ""
 
     try:
-        ocr_text = ocr_with_glm_ocr(image_path, handwriting=handwriting)
+        ocr_text = ocr_with_glm_ocr(image_path, handwriting=handwriting, zhipu_api_key=zhipu_api_key)
         print("[OCR] GLM-OCR 识别成功")
     except Exception as e:
         print(f"[OCR] GLM-OCR 失败 ({e})，切换到 GLM-4V-Flash 备用方案...")
         try:
-            ocr_text = ocr_with_glm4v_fallback(image_path, handwriting=handwriting)
+            ocr_text = ocr_with_glm4v_fallback(image_path, handwriting=handwriting, zhipu_api_key=zhipu_api_key)
             print("[OCR] GLM-4V-Flash 识别成功")
         except Exception as e2:
             raise RuntimeError(f"所有OCR方案均失败: {e2}") from e2
@@ -238,7 +249,8 @@ def read_excel_as_text(excel_path: str) -> str:
 def match_to_template_with_deepseek(
     ocr_text: str,
     headers: list,
-    handwriting: bool = False
+    handwriting: bool = False,
+    deepseek_api_key: str = "",
 ) -> tuple:
     """
     将 OCR 文本和模板表头发给 DeepSeek，在同一次调用中同时提取：
@@ -252,10 +264,8 @@ def match_to_template_with_deepseek(
       任一字段无法识别时为空字符串 ""。
     """
     from openai import OpenAI
-    client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url=DEEPSEEK_BASE_URL,
-    )
+    key = _resolve_runtime_key(deepseek_api_key, ("DEEPSEEK_API_KEY",), "DeepSeek API Key")
+    client = OpenAI(api_key=key, base_url=DEEPSEEK_BASE_URL)
 
     headers_str = json.dumps(headers, ensure_ascii=False)
 
@@ -414,6 +424,8 @@ def process_image(
     log_callback=None,
     handwriting: bool = False,
     template_path: str = None,
+    zhipu_api_key: str = "",
+    deepseek_api_key: str = "",
 ) -> str:
     """
     核心处理流程（单张图片），供外部（GUI）调用。
@@ -457,12 +469,21 @@ def process_image(
         log(f"  → 读取完成，共 {len(ocr_text)} 个字符")
     else:
         log(f"\n[步骤 2/4] 正在调用 AI 识别图片文字（手写体识别: {'开启' if handwriting else '关闭'}）...")
-        ocr_text = ocr_image_with_glm(image_path, handwriting=handwriting)
+        ocr_text = ocr_image_with_glm(
+            image_path,
+            handwriting=handwriting,
+            zhipu_api_key=zhipu_api_key,
+        )
         log(f"  → 识别完成，共 {len(ocr_text)} 个字符")
 
     # 3. DeepSeek 语义匹配（同时提取供应商/日期）
     log("\n[步骤 3/4] 正在进行语义匹配与字段对齐...")
-    records, meta = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
+    records, meta = match_to_template_with_deepseek(
+        ocr_text,
+        headers,
+        handwriting=handwriting,
+        deepseek_api_key=deepseek_api_key,
+    )
     log(f"  → 匹配到 {len(records)} 条商品记录")
     log(f"  → 供应商: {meta.get('supplier') or '未识别'}  |  日期: {meta.get('date') or '未识别'}")
 
@@ -485,6 +506,8 @@ def process_images_batch(
     merged_output_path: str = None,
     progress_callback=None,
     template_path: str = None,
+    zhipu_api_key: str = "",
+    deepseek_api_key: str = "",
 ) -> list:
     """
     批量处理多张图片/Excel，供 GUI 调用。
@@ -539,13 +562,22 @@ def process_images_batch(
             ocr_text = read_excel_as_text(image_path)
         else:
             log(f"  → 调用 OCR（手写体识别: {'开启' if handwriting else '关闭'}）")
-            ocr_text = ocr_image_with_glm(image_path, handwriting=handwriting)
+            ocr_text = ocr_image_with_glm(
+                image_path,
+                handwriting=handwriting,
+                zhipu_api_key=zhipu_api_key,
+            )
 
         log(f"  → 文本长度: {len(ocr_text)} 字符")
 
         # DeepSeek 匹配（同时提取供应商/日期）
         log(f"  → DeepSeek 语义匹配中...")
-        records, meta = match_to_template_with_deepseek(ocr_text, headers, handwriting=handwriting)
+        records, meta = match_to_template_with_deepseek(
+            ocr_text,
+            headers,
+            handwriting=handwriting,
+            deepseek_api_key=deepseek_api_key,
+        )
         log(f"  → 匹配到 {len(records)} 条商品记录")
         log(f"  → 供应商: {meta.get('supplier') or '未识别'}  |  日期: {meta.get('date') or '未识别'}")
 

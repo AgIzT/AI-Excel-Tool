@@ -1,0 +1,8 @@
+PySide6
+requests
+pandas
+xlrd
+Pillow
+openai
+zhipuai
+openpyxl

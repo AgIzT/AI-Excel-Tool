@@ -1,965 +1,1337 @@
 # -*- coding: utf-8 -*-
-"""
-main_app.py
-全自动单据入库系统 —— 现代化 Windows 桌面客户端
-新增功能：
-  · 多文件选择 + 拖拽上传（图片 / Excel）
-  · 手写体识别开关
-  · Excel 直接上传跳过 OCR
-  · 批量处理 + 合并/分别输出选项
-"""
-
 import os
 import sys
-import threading
-import datetime
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
-
-# ── 拖拽支持（可选，未安装时降级为仅点击选择）──────────
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    HAS_DND = True
-except ImportError:
-    HAS_DND = False
-
-# ─────────────────────────────────────────────
-# 全局主题配置
-# ─────────────────────────────────────────────
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+from PySide6.QtCore import QDateTime, QMimeData, QSettings, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QPixmap, QSurfaceFormat, QTextCursor
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QScrollArea,
+    QSizePolicy,
+    QSpacerItem,
+    QStackedWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# 将项目目录提前加入 sys.path，兼容"直接运行 .py"和"PyInstaller EXE"两种模式。
-# PyInstaller 打包时需要在模块顶层看到静态引用才会将 ocr_to_excel 打进包。
 _meipass = getattr(sys, "_MEIPASS", None)
 for _p in filter(None, [_meipass, BASE_DIR]):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# 静态引用：让 PyInstaller 依赖分析能发现并打包 ocr_to_excel / template_manager
-from ocr_to_excel import process_images_batch as _ocr_process_batch      # noqa: E402
-from template_manager import TemplateManager as _TemplateManager          # noqa: E402
+from ai_chat_service import GLMChatAssistant
+from ocr_to_excel import process_images_batch
+from template_manager import TemplateManager
 
-# ─────────────────────────────────────────────
-# 颜色 & 字体常量
-# ─────────────────────────────────────────────
-CLR_BG          = "#0f1117"
-CLR_CARD        = "#1a1d27"
-CLR_CARD2       = "#1e2235"
-CLR_BORDER      = "#2a2d3e"
-CLR_ACCENT      = "#4f8ef7"
-CLR_ACCENT2     = "#7c6af7"
-CLR_SUCCESS     = "#22c55e"
-CLR_WARNING     = "#f59e0b"
-CLR_ERROR       = "#ef4444"
-CLR_TEXT        = "#e2e8f0"
-CLR_TEXT_DIM    = "#64748b"
-CLR_TEXT_BRIGHT = "#ffffff"
+CLR_BG = "#0f1117"
+CLR_CARD = "#1a1d27"
+CLR_CARD2 = "#1e2235"
+CLR_BORDER = "#2a2d3e"
+CLR_ACCENT = "#4f8ef7"
+CLR_ACCENT2 = "#7c6af7"
+CLR_SUCCESS = "#22c55e"
+CLR_WARNING = "#f59e0b"
+CLR_ERROR = "#ef4444"
+CLR_TEXT = "#e2e8f0"
+CLR_TEXT_DIM = "#64748b"
 
-FONT_TITLE  = ("Microsoft YaHei UI", 22, "bold")
-FONT_HEADER = ("Microsoft YaHei UI", 13, "bold")
-FONT_BODY   = ("Microsoft YaHei UI", 12)
-FONT_SMALL  = ("Microsoft YaHei UI", 10)
-FONT_MONO   = ("Consolas", 11)
-
-# 支持的文件类型
-IMG_EXTS   = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
-EXCEL_EXTS = {".xlsx", ".xls"}
-ALL_EXTS   = IMG_EXTS | EXCEL_EXTS
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+EXCEL_EXTS = {".xlsx", ".xls", ".csv"}
+ALL_EXTS = IMG_EXTS | EXCEL_EXTS
 
 
-# ─────────────────────────────────────────────
-# 主应用窗口
-# ─────────────────────────────────────────────
-class App(ctk.CTk if not HAS_DND else TkinterDnD.Tk):
-    def __init__(self):
+class BatchWorker(QThread):
+    progress_update = Signal(int, int)
+    log_message = Signal(str)
+    task_finished = Signal(list)
+    task_failed = Signal(str)
+
+    def __init__(self, image_paths, output_dir, handwriting, merge_output, template_path, glm_api_key, deepseek_api_key):
         super().__init__()
+        self._image_paths = list(image_paths)
+        self._output_dir = output_dir
+        self._handwriting = bool(handwriting)
+        self._merge_output = bool(merge_output)
+        self._template_path = template_path
+        self._glm_api_key = (glm_api_key or "").strip()
+        self._deepseek_api_key = (deepseek_api_key or "").strip()
 
-        # ── 状态变量 ──────────────────────────
-        self.selected_files: list  = []   # 已选文件路径列表
-        self.output_excel_paths: list = []
-        self.is_processing = False
-
-        # 模板管理器
-        self.template_manager = _TemplateManager(BASE_DIR)
-
-        # 选项变量
-        self.handwriting_var = ctk.BooleanVar(value=False)
-        self.merge_var       = ctk.BooleanVar(value=False)
-        self.template_var    = ctk.StringVar(value=self.template_manager.get_default_name())
-
-        self._build_window()
-        self._build_layout()
-
-        # 注册拖拽（需要 tkinterdnd2）
-        if HAS_DND:
-            self._register_drop()
-
-    # ── 窗口基础设置 ────────────────────────────
-    def _build_window(self):
-        self.title("全自动单据入库系统")
-        self.geometry("1060x760")
-        self.minsize(900, 640)
-        self.configure(bg=CLR_BG)
-
-        self.update_idletasks()
-        w = self.winfo_screenwidth()
-        h = self.winfo_screenheight()
-        x = (w - 1060) // 2
-        y = (h - 760) // 2
-        self.geometry(f"1060x760+{x}+{y}")
-
+    def run(self):
         try:
-            self.iconbitmap(os.path.join(BASE_DIR, "icon.ico"))
-        except Exception:
-            pass
-
-    # ── 整体布局 ────────────────────────────────
-    def _build_layout(self):
-        self._build_header()
-
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        content.columnconfigure(0, weight=1)
-        content.columnconfigure(1, weight=1)
-        content.rowconfigure(0, weight=1)
-
-        self._build_left_panel(content)
-        self._build_right_panel(content)
-        self._build_statusbar()
-
-    # ── 顶部标题栏 ──────────────────────────────
-    def _build_header(self):
-        header = ctk.CTkFrame(self, fg_color=CLR_CARD, corner_radius=0, height=70)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-
-        logo_frame = ctk.CTkFrame(header, fg_color="transparent")
-        logo_frame.pack(side="left", padx=25, pady=10)
-
-        ctk.CTkLabel(
-            logo_frame, text=" AI ",
-            font=("Microsoft YaHei UI", 14, "bold"),
-            fg_color=CLR_ACCENT, text_color=CLR_TEXT_BRIGHT,
-            corner_radius=6, width=40, height=32,
-        ).pack(side="left", padx=(0, 12))
-
-        title_frame = ctk.CTkFrame(logo_frame, fg_color="transparent")
-        title_frame.pack(side="left")
-
-        ctk.CTkLabel(
-            title_frame, text="全自动单据入库系统",
-            font=FONT_TITLE, text_color=CLR_TEXT_BRIGHT,
-        ).pack(anchor="w")
-
-        ctk.CTkLabel(
-            title_frame, text="GLM-OCR  ×  DeepSeek  →  Excel  |  支持批量 / 拖拽 / 手写体",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM,
-        ).pack(anchor="w")
-
-        ctk.CTkLabel(
-            header, text="v2.0",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM,
-        ).pack(side="right", padx=25)
-
-    # ── 左列：操作面板 ──────────────────────────
-    def _build_left_panel(self, parent):
-        left = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=16)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=10)
-
-        self._section_label(left, "⚙  操作控制台")
-
-        self.steps_frame = steps_frame = ctk.CTkScrollableFrame(left, fg_color="transparent")
-        steps_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
-
-        # ── 步骤 1：选择文件（多选 + 拖拽）──────
-        step1_card = ctk.CTkFrame(steps_frame, fg_color=CLR_CARD2, corner_radius=12)
-        step1_card.pack(fill="x", pady=(0, 6))
-
-        step1_inner = ctk.CTkFrame(step1_card, fg_color="transparent")
-        step1_inner.pack(fill="x", padx=14, pady=12)
-
-        # 步骤号
-        ctk.CTkLabel(
-            step1_inner, text="01",
-            font=("Microsoft YaHei UI", 13, "bold"),
-            fg_color=CLR_ACCENT, text_color=CLR_TEXT_BRIGHT,
-            corner_radius=8, width=36, height=36,
-        ).pack(side="left", padx=(0, 12))
-
-        # 文字说明
-        txt_f = ctk.CTkFrame(step1_inner, fg_color="transparent")
-        txt_f.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(
-            txt_f, text="选择单据文件（支持多选）",
-            font=("Microsoft YaHei UI", 12, "bold"),
-            text_color=CLR_TEXT, anchor="w",
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            txt_f, text="图片(JPG/PNG/BMP/WEBP) 或 Excel(XLSX/XLS)，可多选或拖拽",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM, anchor="w", wraplength=220,
-        ).pack(anchor="w")
-
-        # 按钮区
-        btn_col = ctk.CTkFrame(step1_inner, fg_color="transparent")
-        btn_col.pack(side="right")
-
-        ctk.CTkButton(
-            btn_col, text="📂  浏览文件",
-            font=FONT_BODY, width=120, height=34,
-            fg_color=CLR_ACCENT, hover_color=self._darken(CLR_ACCENT),
-            text_color=CLR_TEXT_BRIGHT, corner_radius=8,
-            command=self._on_select_files,
-        ).pack(pady=(0, 4))
-
-        ctk.CTkButton(
-            btn_col, text="🗑  清空列表",
-            font=FONT_SMALL, width=120, height=28,
-            fg_color=CLR_BORDER, hover_color="#3a3d50",
-            text_color=CLR_TEXT_DIM, corner_radius=6,
-            command=self._on_clear_files,
-        ).pack()
-
-        # 拖拽提示区
-        self.drop_zone = ctk.CTkFrame(
-            steps_frame, fg_color=CLR_CARD2, corner_radius=10,
-            border_width=2, border_color=CLR_BORDER,
-        )
-        self.drop_zone.pack(fill="x", pady=(0, 4))
-
-        self.drop_label = ctk.CTkLabel(
-            self.drop_zone,
-            text="🖱  将图片或 Excel 文件拖拽到此处\n（或点击上方【浏览文件】多选）",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM,
-        )
-        self.drop_label.pack(pady=14)
-
-        # 已选文件列表
-        self.file_list_frame = ctk.CTkScrollableFrame(
-            steps_frame, fg_color=CLR_CARD2, corner_radius=8, height=100,
-        )
-        self.file_list_frame.pack(fill="x", pady=(0, 4))
-
-        self.file_count_label = ctk.CTkLabel(
-            steps_frame, text="尚未选择文件",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM, anchor="w",
-        )
-        self.file_count_label.pack(fill="x", padx=4, pady=(0, 8))
-
-        # 分割线
-        ctk.CTkFrame(steps_frame, fg_color=CLR_BORDER, height=1).pack(fill="x", pady=6)
-
-        # ── 识别选项区 ──────────────────────────
-        self._section_label(steps_frame, "🔧  识别选项", font=FONT_SMALL, padx=4)
-
-        opt_frame = ctk.CTkFrame(steps_frame, fg_color=CLR_CARD2, corner_radius=10)
-        opt_frame.pack(fill="x", pady=(0, 8))
-
-        # ── 模板选择 ──────────────────────────
-        self._build_template_selector(opt_frame)
-
-        # 手写体识别开关
-        hw_row = ctk.CTkFrame(opt_frame, fg_color="transparent")
-        hw_row.pack(fill="x", padx=14, pady=(10, 6))
-
-        ctk.CTkLabel(
-            hw_row, text="✍  手写体识别",
-            font=FONT_BODY, text_color=CLR_TEXT, anchor="w",
-        ).pack(side="left", fill="x", expand=True)
-
-        self.hw_switch = ctk.CTkSwitch(
-            hw_row, text="",
-            variable=self.handwriting_var,
-            onvalue=True, offvalue=False,
-            fg_color=CLR_BORDER, progress_color=CLR_ACCENT2,
-            command=self._on_hw_toggle,
-        )
-        self.hw_switch.pack(side="right")
-
-        self.hw_desc_label = ctk.CTkLabel(
-            opt_frame,
-            text="关闭：仅识别印刷文字",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM, anchor="w",
-        )
-        self.hw_desc_label.pack(fill="x", padx=14, pady=(0, 10))
-
-        # 输出模式
-        merge_row = ctk.CTkFrame(opt_frame, fg_color="transparent")
-        merge_row.pack(fill="x", padx=14, pady=(0, 6))
-
-        ctk.CTkLabel(
-            merge_row, text="📦  合并输出到一个 Excel",
-            font=FONT_BODY, text_color=CLR_TEXT, anchor="w",
-        ).pack(side="left", fill="x", expand=True)
-
-        ctk.CTkSwitch(
-            merge_row, text="",
-            variable=self.merge_var,
-            onvalue=True, offvalue=False,
-            fg_color=CLR_BORDER, progress_color=CLR_SUCCESS,
-        ).pack(side="right")
-
-        ctk.CTkLabel(
-            opt_frame,
-            text="关闭：每张图片/文件分别生成独立 Excel",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM, anchor="w",
-        ).pack(fill="x", padx=14, pady=(0, 10))
-
-        # 分割线
-        ctk.CTkFrame(steps_frame, fg_color=CLR_BORDER, height=1).pack(fill="x", pady=6)
-
-        # ── 步骤 2：开始处理 ────────────────────
-        self._build_step_card(
-            steps_frame,
-            step_num="02",
-            title="AI 识别并生成 Excel",
-            desc="GLM-OCR 识图 → DeepSeek 匹配 → 导出标准表格",
-            color=CLR_ACCENT2,
-            action=self._on_start_process,
-            btn_text="🚀  开始识别",
-        )
-
-        # 进度条
-        self.progress_bar = ctk.CTkProgressBar(
-            steps_frame, height=6, corner_radius=3,
-            fg_color=CLR_BORDER, progress_color=CLR_ACCENT,
-        )
-        self.progress_bar.set(0)
-        self.progress_bar.pack(fill="x", padx=4, pady=(4, 0))
-
-        self.progress_label = ctk.CTkLabel(
-            steps_frame, text="",
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM, anchor="w",
-        )
-        self.progress_label.pack(fill="x", padx=4, pady=(2, 8))
-
-        # 分割线
-        ctk.CTkFrame(steps_frame, fg_color=CLR_BORDER, height=1).pack(fill="x", pady=6)
-
-        # ── 步骤 3：打开文件 ────────────────────
-        self._build_step_card(
-            steps_frame,
-            step_num="03",
-            title="打开输出文件",
-            desc="用 Excel 查看已生成的标准进货单",
-            color=CLR_SUCCESS,
-            action=self._on_open_output,
-            btn_text="📊  打开 Excel",
-        )
-
-        # 处理历史
-        ctk.CTkFrame(steps_frame, fg_color=CLR_BORDER, height=1).pack(fill="x", pady=6)
-        self._section_label(steps_frame, "📋  处理历史", font=FONT_SMALL, padx=4)
-
-        self.history_frame = ctk.CTkFrame(steps_frame, fg_color="transparent")
-        self.history_frame.pack(fill="x", padx=4)
-
-    # ── 右列：预览 + 日志 ──────────────────────
-    def _build_right_panel(self, parent):
-        right = ctk.CTkFrame(parent, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=10)
-        right.rowconfigure(0, weight=2)
-        right.rowconfigure(1, weight=3)
-        right.columnconfigure(0, weight=1)
-
-        # 上：图片预览
-        preview_card = ctk.CTkFrame(right, fg_color=CLR_CARD, corner_radius=16)
-        preview_card.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-
-        self._section_label(preview_card, "🖼  图片预览（最新选中）")
-
-        self.preview_frame = ctk.CTkFrame(
-            preview_card, fg_color=CLR_CARD2, corner_radius=10
-        )
-        self.preview_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-
-        self.preview_label = ctk.CTkLabel(
-            self.preview_frame,
-            text="请先选择单据图片\n\n支持拖拽或点击按钮上传",
-            font=FONT_BODY, text_color=CLR_TEXT_DIM,
-        )
-        self.preview_label.pack(expand=True)
-
-        # 下：实时日志
-        log_card = ctk.CTkFrame(right, fg_color=CLR_CARD, corner_radius=16)
-        log_card.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-
-        self._section_label(log_card, "📡  实时处理日志")
-
-        self.log_box = ctk.CTkTextbox(
-            log_card, font=FONT_MONO,
-            fg_color=CLR_CARD2, text_color="#a8b4c8",
-            corner_radius=10, wrap="word", state="disabled",
-        )
-        self.log_box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-
-        log_toolbar = ctk.CTkFrame(log_card, fg_color="transparent")
-        log_toolbar.pack(fill="x", padx=16, pady=(0, 12))
-
-        ctk.CTkButton(
-            log_toolbar, text="清空日志",
-            font=FONT_SMALL, width=90, height=28,
-            fg_color=CLR_BORDER, hover_color="#3a3d50",
-            text_color=CLR_TEXT_DIM, corner_radius=6,
-            command=self._clear_log,
-        ).pack(side="right")
-
-    # ── 底部状态栏 ──────────────────────────────
-    def _build_statusbar(self):
-        bar = ctk.CTkFrame(self, fg_color=CLR_CARD, corner_radius=0, height=32)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-
-        self.status_dot = ctk.CTkLabel(
-            bar, text="●", font=FONT_SMALL, text_color=CLR_TEXT_DIM
-        )
-        self.status_dot.pack(side="left", padx=(16, 4))
-
-        self.status_text = ctk.CTkLabel(
-            bar, text="就绪", font=FONT_SMALL, text_color=CLR_TEXT_DIM
-        )
-        self.status_text.pack(side="left")
-
-        dnd_hint = "  |  支持拖拽文件" if HAS_DND else "  |  提示：安装 tkinterdnd2 可启用拖拽"
-        ctk.CTkLabel(
-            bar, text=dnd_hint,
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM,
-        ).pack(side="right", padx=16)
-
-    # ── 通用辅助：节标题 ────────────────────────
-    def _section_label(self, parent, text, font=FONT_HEADER, padx=16):
-        ctk.CTkLabel(
-            parent, text=text, font=font,
-            text_color=CLR_TEXT, anchor="w",
-        ).pack(fill="x", padx=padx, pady=(16, 8))
-
-    # ── 通用辅助：步骤卡片 ──────────────────────
-    def _build_step_card(self, parent, step_num, title, desc, color, action, btn_text):
-        card = ctk.CTkFrame(parent, fg_color=CLR_CARD2, corner_radius=12)
-        card.pack(fill="x", pady=(0, 6))
-
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="x", padx=14, pady=12)
-
-        ctk.CTkLabel(
-            inner, text=step_num,
-            font=("Microsoft YaHei UI", 13, "bold"),
-            fg_color=color, text_color=CLR_TEXT_BRIGHT,
-            corner_radius=8, width=36, height=36,
-        ).pack(side="left", padx=(0, 12))
-
-        text_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        text_frame.pack(side="left", fill="x", expand=True)
-
-        ctk.CTkLabel(
-            text_frame, text=title,
-            font=("Microsoft YaHei UI", 12, "bold"),
-            text_color=CLR_TEXT, anchor="w",
-        ).pack(anchor="w")
-
-        ctk.CTkLabel(
-            text_frame, text=desc,
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM,
-            anchor="w", wraplength=200,
-        ).pack(anchor="w")
-
-        btn = ctk.CTkButton(
-            inner, text=btn_text,
-            font=FONT_BODY, width=130, height=36,
-            fg_color=color, hover_color=self._darken(color),
-            text_color=CLR_TEXT_BRIGHT, corner_radius=8,
-            command=action,
-        )
-        btn.pack(side="right")
-        return btn
-
-    def _darken(self, hex_color, factor=0.75):
-        hex_color = hex_color.lstrip("#")
-        r, g, b = (int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-        return "#{:02x}{:02x}{:02x}".format(
-            int(r * factor), int(g * factor), int(b * factor)
-        )
-
-    # ── 模板选择器 UI ────────────────────────────
-    def _build_template_selector(self, parent):
-        """模板下拉选择行 + 添加自定义模板按钮"""
-        tpl_row = ctk.CTkFrame(parent, fg_color="transparent")
-        tpl_row.pack(fill="x", padx=14, pady=(10, 2))
-
-        ctk.CTkLabel(
-            tpl_row, text="📋  导出模板",
-            font=FONT_BODY, text_color=CLR_TEXT, anchor="w",
-        ).pack(side="left", fill="x", expand=True)
-
-        names = self.template_manager.get_template_names()
-        if not names:
-            names = ["（无可用模板）"]
-
-        self.template_menu = ctk.CTkOptionMenu(
-            tpl_row,
-            values=names,
-            variable=self.template_var,
-            font=FONT_SMALL,
-            width=168, height=28,
-            fg_color=CLR_CARD,
-            button_color=CLR_ACCENT,
-            button_hover_color=self._darken(CLR_ACCENT),
-            dropdown_fg_color=CLR_CARD2,
-            dropdown_text_color=CLR_TEXT,
-            text_color=CLR_TEXT,
-            command=self._on_template_change,
-        )
-        self.template_menu.pack(side="right")
-
-        # 添加自定义模板按钮（右对齐，轻量样式）
-        add_row = ctk.CTkFrame(parent, fg_color="transparent")
-        add_row.pack(fill="x", padx=14, pady=(2, 8))
-
-        ctk.CTkButton(
-            add_row, text="＋  添加自定义模板",
-            font=FONT_SMALL, height=22, width=140,
-            fg_color="transparent", hover_color=CLR_CARD,
-            text_color=CLR_ACCENT, corner_radius=4,
-            command=self._on_add_custom_template,
-        ).pack(side="right")
-
-        # 分隔线
-        ctk.CTkFrame(parent, fg_color=CLR_BORDER, height=1).pack(
-            fill="x", padx=14, pady=(0, 4)
-        )
-
-    def _on_template_change(self, name: str):
-        """模板下拉切换回调"""
-        self._log(f"[模板] 已切换到：{name}", color="info")
-        self._set_status(f"模板：{name}", color=CLR_TEXT_DIM)
-
-    def _on_add_custom_template(self):
-        """添加自定义模板：弹出文件对话框，保存到 TemplateManager"""
-        path = filedialog.askopenfilename(
-            title="选择自定义模板文件",
-            filetypes=[
-                ("Excel 模板", "*.xls *.xlsx"),
-                ("所有文件", "*.*"),
-            ],
-        )
-        if not path:
-            return
-
-        name = os.path.splitext(os.path.basename(path))[0]
-        existing = self.template_manager.get_all_templates()
-        if name in existing:
-            if not messagebox.askyesno(
-                "重复模板", f"已存在同名模板「{name}」，是否覆盖？"
-            ):
-                return
-
-        try:
-            self.template_manager.add_custom_template(name, path)
-        except Exception as e:
-            messagebox.showerror("添加失败", str(e))
-            return
-
-        names = self.template_manager.get_template_names()
-        self.template_menu.configure(values=names)
-        self.template_var.set(name)
-        self._log(f"[模板] 已添加自定义模板：{name}", color="success")
-        messagebox.showinfo("添加成功", f"自定义模板「{name}」已添加！\n下次启动后仍会保留。")
-
-    # ─────────────────────────────────────────────
-    # 拖拽注册
-    # ─────────────────────────────────────────────
-    def _register_drop(self):
-        """注册整个窗口和拖拽区域的 drop 事件"""
-        try:
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind("<<Drop>>", self._on_drop)
-            self.drop_zone.drop_target_register(DND_FILES)
-            self.drop_zone.dnd_bind("<<Drop>>", self._on_drop)
-            # 更新提示文字
-            self.drop_label.configure(
-                text="🖱  将图片或 Excel 文件拖拽到此处\n（支持多文件同时拖入）",
-                text_color=CLR_ACCENT,
+            def log_cb(msg: str):
+                self.log_message.emit(msg)
+
+            def progress_cb(current: int, total: int):
+                self.progress_update.emit(current + 1, total)
+
+            result = process_images_batch(
+                image_paths=self._image_paths,
+                output_dir=self._output_dir,
+                log_callback=log_cb,
+                handwriting=self._handwriting,
+                merge_output=self._merge_output,
+                merged_output_path=None,
+                progress_callback=progress_cb,
+                template_path=self._template_path,
+                zhipu_api_key=self._glm_api_key,
+                deepseek_api_key=self._deepseek_api_key,
             )
-        except Exception:
-            pass
+            self.task_finished.emit(result)
+        except Exception as e:
+            self.task_failed.emit(str(e))
 
-    def _on_drop(self, event):
-        """处理拖拽事件"""
-        raw = event.data
-        # tkinterdnd2 返回的路径可能用 {} 包裹（含空格时）
-        paths = self._parse_drop_paths(raw)
-        valid = [p for p in paths if os.path.splitext(p)[-1].lower() in ALL_EXTS]
-        if not valid:
-            self._log("[拖拽] 未检测到支持的文件格式（图片或 Excel）", color="warn")
+
+class AIChatWorker(QThread):
+    response_ready = Signal(str)
+    task_failed = Signal(str)
+
+    def __init__(self, send_func, user_message, api_key):
+        super().__init__()
+        self._send_func = send_func
+        self._user_message = user_message
+        self._api_key = api_key
+
+    def run(self):
+        try:
+            answer = self._send_func(self._user_message, self._api_key)
+            self.response_ready.emit(answer)
+        except Exception as e:
+            self.task_failed.emit(str(e))
+
+
+class FileDropListWidget(QListWidget):
+    files_dropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(False)
+        self.setAlternatingRowColors(False)
+        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+
+    def dragEnterEvent(self, event):
+        if self._has_urls(event.mimeData()):
+            event.acceptProposedAction()
             return
-        self._add_files(valid)
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._has_urls(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._extract_paths(event.mimeData())
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        event.ignore()
 
     @staticmethod
-    def _parse_drop_paths(raw: str) -> list:
-        """解析 tkinterdnd2 返回的路径字符串"""
-        raw = raw.strip()
+    def _has_urls(mime: QMimeData):
+        return bool(mime and mime.hasUrls())
+
+    @staticmethod
+    def _extract_paths(mime: QMimeData):
+        if not mime or not mime.hasUrls():
+            return []
         paths = []
-        # 处理 {path with spaces} 格式
-        import re
-        tokens = re.findall(r'\{([^}]+)\}|(\S+)', raw)
-        for t in tokens:
-            p = t[0] if t[0] else t[1]
-            if p:
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            p = os.path.abspath(url.toLocalFile())
+            if os.path.isfile(p):
                 paths.append(p)
         return paths
 
-    # ─────────────────────────────────────────────
-    # 文件管理
-    # ─────────────────────────────────────────────
-    def _on_select_files(self):
-        """多选文件对话框"""
-        paths = filedialog.askopenfilenames(
-            title="选择单据文件（可多选）",
-            filetypes=[
-                ("支持的文件", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.xlsx *.xls"),
-                ("图片文件",   "*.jpg *.jpeg *.png *.bmp *.webp *.tiff"),
-                ("Excel 文件", "*.xlsx *.xls"),
-                ("所有文件",   "*.*"),
-            ],
+
+class ChatInputTextEdit(QTextEdit):
+    send_requested = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(event)
+                return
+            self.send_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class ChatBubbleWidget(QFrame):
+    def __init__(self, role: str, text: str, loading: bool = False, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self.loading = loading
+        self.setObjectName("chatBubbleUser" if role == "user" else "chatBubbleAI")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+        self.label = QLabel(text, self)
+        self.label.setObjectName("chatBubbleText")
+        self.label.setWordWrap(True)
+        self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.label.setMaximumWidth(720)
+        layout.addWidget(self.label, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.setMaximumWidth(760)
+
+    def set_message(self, text: str):
+        self.label.setText(text)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.settings = QSettings("InvoiceAI", "InvoiceAIDesktop")
+        self.template_manager = TemplateManager(BASE_DIR)
+        self.selected_files = []
+        self._selected_file_set = set()
+        self.output_excel_paths = []
+        self.chat_assistant = None
+        self._chat_api_key = ""
+        self._active_route = ""
+        self._pages = {}
+        self._route_indexes = {}
+        self._nav_buttons = {}
+        self._worker = None
+        self._ai_worker = None
+        self._processing = False
+        self._ai_busy = False
+        self._log_buffer = []
+        self._log_collapsed = True
+        self._preview_path = ""
+        self._preview_source = QPixmap()
+        self._pending_ai_bubble = None
+
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.setInterval(90)
+        self._log_flush_timer.timeout.connect(self._flush_log_buffer)
+
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(180)
+        self._resize_timer.timeout.connect(self._on_resize_stable)
+
+        self._route_builders = {
+            "单据处理": self._build_doc_page,
+            "AI助手": self._build_ai_page,
+            "设置": self._build_setting_page,
+        }
+
+        self._build_window()
+        self._build_layout()
+        self._apply_style()
+        self._switch_route("单据处理")
+        self._append_log("PySide6 阶段三已启动")
+
+    def _build_window(self):
+        self.setWindowTitle("全自动单据入库系统 - PySide6")
+        self.resize(1360, 860)
+        self.setMinimumSize(1080, 700)
+
+    def _build_layout(self):
+        root = QWidget(self)
+        self.setCentralWidget(root)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        content_wrap = QWidget(root)
+        content_layout = QHBoxLayout(content_wrap)
+        content_layout.setContentsMargins(12, 12, 12, 8)
+        content_layout.setSpacing(12)
+        root_layout.addWidget(content_wrap, 1)
+
+        self.sidebar = QFrame(content_wrap)
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setFixedWidth(220)
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(12, 12, 12, 12)
+        sidebar_layout.setSpacing(8)
+        content_layout.addWidget(self.sidebar, 0)
+
+        self._build_sidebar(sidebar_layout)
+
+        self.workspace = QWidget(content_wrap)
+        workspace_layout = QVBoxLayout(self.workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(10)
+        content_layout.addWidget(self.workspace, 1)
+
+        top_bar = QFrame(self.workspace)
+        top_bar.setObjectName("topBar")
+        top_bar.setFixedHeight(60)
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(18, 8, 18, 8)
+        top_layout.setSpacing(8)
+        self.page_title = QLabel("单据处理", top_bar)
+        self.page_title.setObjectName("pageTitle")
+        top_layout.addWidget(self.page_title, 1)
+        self.window_size_label = QLabel("窗口: -", top_bar)
+        self.window_size_label.setObjectName("dimLabel")
+        top_layout.addWidget(self.window_size_label, 0, Qt.AlignmentFlag.AlignRight)
+        workspace_layout.addWidget(top_bar, 0)
+
+        self.page_stack = QStackedWidget(self.workspace)
+        self.page_stack.setObjectName("pageStack")
+        workspace_layout.addWidget(self.page_stack, 1)
+
+        self.log_drawer = QFrame(root)
+        self.log_drawer.setObjectName("logDrawer")
+        log_layout = QVBoxLayout(self.log_drawer)
+        log_layout.setContentsMargins(12, 8, 12, 12)
+        log_layout.setSpacing(6)
+        root_layout.addWidget(self.log_drawer, 0)
+
+        log_header = QWidget(self.log_drawer)
+        log_header_layout = QHBoxLayout(log_header)
+        log_header_layout.setContentsMargins(0, 0, 0, 0)
+        log_header_layout.setSpacing(8)
+        log_title = QLabel("实时日志", log_header)
+        log_title.setObjectName("sectionTitle")
+        log_header_layout.addWidget(log_title, 1)
+        self.log_toggle_btn = QPushButton("展开", log_header)
+        self.log_toggle_btn.setObjectName("logToggleButton")
+        self.log_toggle_btn.setFixedSize(76, 28)
+        self.log_toggle_btn.clicked.connect(self._toggle_log_drawer)
+        log_header_layout.addWidget(self.log_toggle_btn, 0, Qt.AlignmentFlag.AlignRight)
+        log_layout.addWidget(log_header, 0)
+
+        self.log_box = QTextEdit(self.log_drawer)
+        self.log_box.setObjectName("logBox")
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(190)
+        self.log_box.setVisible(False)
+        log_layout.addWidget(self.log_box, 0)
+
+    def _build_sidebar(self, layout: QVBoxLayout):
+        brand = QFrame(self.sidebar)
+        brand.setObjectName("brandCard")
+        brand.setFixedHeight(72)
+        brand_layout = QVBoxLayout(brand)
+        brand_layout.setContentsMargins(12, 8, 12, 8)
+        brand_layout.setSpacing(0)
+        title = QLabel("Invoice AI", brand)
+        title.setObjectName("brandTitle")
+        subtitle = QLabel("PySide6 业务版", brand)
+        subtitle.setObjectName("dimLabel")
+        brand_layout.addWidget(title, 0)
+        brand_layout.addWidget(subtitle, 0)
+        layout.addWidget(brand, 0)
+
+        for route in ["单据处理", "AI助手", "设置"]:
+            btn = QPushButton(route, self.sidebar)
+            btn.setObjectName("navButton")
+            btn.setProperty("active", False)
+            btn.setFixedHeight(42)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, r=route: self._switch_route(r))
+            layout.addWidget(btn, 0)
+            self._nav_buttons[route] = btn
+
+        divider = QFrame(self.sidebar)
+        divider.setObjectName("divider")
+        divider.setFixedHeight(1)
+        layout.addWidget(divider, 0)
+        layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+
+        self.sidebar_status = QLabel("状态：就绪", self.sidebar)
+        self.sidebar_status.setObjectName("dimLabel")
+        layout.addWidget(self.sidebar_status, 0)
+
+    def _switch_route(self, route: str):
+        if route == self._active_route:
+            return
+        self._active_route = route
+        self.page_title.setText(route)
+        self.sidebar_status.setText(f"状态：{route}")
+
+        for name, btn in self._nav_buttons.items():
+            active = name == route
+            btn.setProperty("active", active)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+        if route not in self._pages:
+            page = self._route_builders[route]()
+            idx = self.page_stack.addWidget(page)
+            self._pages[route] = page
+            self._route_indexes[route] = idx
+
+        self.page_stack.setCurrentIndex(self._route_indexes[route])
+        self._append_log(f"路由切换 -> {route}")
+
+    def _build_doc_page(self):
+        page = QWidget(self.page_stack)
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        left = QFrame(page)
+        left.setObjectName("card")
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(16, 14, 16, 14)
+        left_layout.setSpacing(8)
+        layout.addWidget(left, 7)
+
+        left_title = QLabel("文件上传与任务执行", left)
+        left_title.setObjectName("sectionTitle")
+        left_layout.addWidget(left_title, 0)
+
+        file_toolbar = QWidget(left)
+        file_toolbar_layout = QHBoxLayout(file_toolbar)
+        file_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        file_toolbar_layout.setSpacing(8)
+        self.pick_files_btn = QPushButton("📂 浏览文件", file_toolbar)
+        self.pick_files_btn.setObjectName("secondaryButton")
+        self.pick_files_btn.clicked.connect(self._on_pick_files)
+        self.clear_files_btn = QPushButton("🗑 清空列表", file_toolbar)
+        self.clear_files_btn.setObjectName("secondaryButton")
+        self.clear_files_btn.clicked.connect(self._on_clear_files)
+        self.remove_selected_btn = QPushButton("✕ 移除选中", file_toolbar)
+        self.remove_selected_btn.setObjectName("secondaryButton")
+        self.remove_selected_btn.clicked.connect(self._on_remove_selected_file)
+        file_toolbar_layout.addWidget(self.pick_files_btn, 0)
+        file_toolbar_layout.addWidget(self.clear_files_btn, 0)
+        file_toolbar_layout.addWidget(self.remove_selected_btn, 0)
+        file_toolbar_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
+        left_layout.addWidget(file_toolbar, 0)
+
+        drop_hint = QLabel("将图片/Excel 直接拖拽到下方文件列表", left)
+        drop_hint.setObjectName("dimLabel")
+        left_layout.addWidget(drop_hint, 0)
+
+        self.file_list = FileDropListWidget(left)
+        self.file_list.setObjectName("fileList")
+        self.file_list.files_dropped.connect(self._add_files)
+        self.file_list.itemSelectionChanged.connect(self._on_file_selection_changed)
+        left_layout.addWidget(self.file_list, 1)
+
+        self.file_stats_label = QLabel("尚未选择文件", left)
+        self.file_stats_label.setObjectName("dimLabel")
+        left_layout.addWidget(self.file_stats_label, 0)
+
+        action_row = QWidget(left)
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(8)
+        self.start_btn = QPushButton("🚀 开始识别", action_row)
+        self.start_btn.setObjectName("accentButton")
+        self.start_btn.clicked.connect(self._on_start_process)
+        self.open_btn = QPushButton("📊 打开输出", action_row)
+        self.open_btn.setObjectName("successButton")
+        self.open_btn.clicked.connect(self._on_open_output)
+        action_layout.addWidget(self.start_btn, 1)
+        action_layout.addWidget(self.open_btn, 1)
+        left_layout.addWidget(action_row, 0)
+
+        self.progress_bar = QProgressBar(left)
+        self.progress_bar.setObjectName("progressBar")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        left_layout.addWidget(self.progress_bar, 0)
+
+        self.progress_label = QLabel("", left)
+        self.progress_label.setObjectName("dimLabel")
+        left_layout.addWidget(self.progress_label, 0)
+
+        right = QFrame(page)
+        right.setObjectName("card")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 14, 16, 14)
+        right_layout.setSpacing(8)
+        layout.addWidget(right, 5)
+
+        right_title = QLabel("预览与识别选项", right)
+        right_title.setObjectName("sectionTitle")
+        right_layout.addWidget(right_title, 0)
+
+        preview_card = QFrame(right)
+        preview_card.setObjectName("subCard")
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(10, 10, 10, 10)
+        preview_layout.setSpacing(6)
+        self.preview_label = QLabel("请选择图片文件进行预览", preview_card)
+        self.preview_label.setObjectName("previewLabel")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumHeight(260)
+        right_layout.addWidget(preview_card, 1)
+        preview_layout.addWidget(self.preview_label, 1)
+
+        options = QFrame(right)
+        options.setObjectName("subCard")
+        options_layout = QVBoxLayout(options)
+        options_layout.setContentsMargins(14, 10, 14, 10)
+        options_layout.setSpacing(8)
+
+        tpl_row = QWidget(options)
+        tpl_row_layout = QHBoxLayout(tpl_row)
+        tpl_row_layout.setContentsMargins(0, 0, 0, 0)
+        tpl_row_layout.setSpacing(8)
+        tpl_label = QLabel("模板", tpl_row)
+        tpl_label.setObjectName("dimLabel")
+        self.template_combo = QComboBox(tpl_row)
+        self.template_combo.setObjectName("comboBox")
+        self._load_templates()
+        tpl_row_layout.addWidget(tpl_label, 0)
+        tpl_row_layout.addWidget(self.template_combo, 1)
+        options_layout.addWidget(tpl_row, 0)
+
+        add_tpl_btn = QPushButton("＋ 添加自定义模板", options)
+        add_tpl_btn.setObjectName("secondaryButton")
+        add_tpl_btn.clicked.connect(self._on_add_custom_template)
+        options_layout.addWidget(add_tpl_btn, 0)
+
+        self.handwriting_check = QCheckBox("手写体识别", options)
+        self.handwriting_check.setChecked(False)
+        options_layout.addWidget(self.handwriting_check, 0)
+
+        self.merge_check = QCheckBox("合并输出到一个 Excel", options)
+        self.merge_check.setChecked(False)
+        options_layout.addWidget(self.merge_check, 0)
+
+        right_layout.addWidget(options, 0)
+        return page
+
+    def _build_ai_page(self):
+        page = QWidget(self.page_stack)
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        left = QFrame(page)
+        left.setObjectName("card")
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(16, 14, 16, 14)
+        left_layout.setSpacing(10)
+        layout.addWidget(left, 8)
+
+        top_row = QWidget(left)
+        top_row_layout = QHBoxLayout(top_row)
+        top_row_layout.setContentsMargins(0, 0, 0, 0)
+        top_row_layout.setSpacing(8)
+        title = QLabel("AI 对话助手", top_row)
+        title.setObjectName("sectionTitle")
+        top_row_layout.addWidget(title, 1)
+        self.chat_reset_btn = QPushButton("清空对话", top_row)
+        self.chat_reset_btn.setObjectName("secondaryButton")
+        self.chat_reset_btn.clicked.connect(self._on_reset_chat)
+        self.chat_reset_btn.setFixedHeight(32)
+        top_row_layout.addWidget(self.chat_reset_btn, 0)
+        left_layout.addWidget(top_row, 0)
+
+        self.chat_scroll = QScrollArea(left)
+        self.chat_scroll.setObjectName("chatScroll")
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_stream_widget = QWidget(self.chat_scroll)
+        self.chat_stream_layout = QVBoxLayout(self.chat_stream_widget)
+        self.chat_stream_layout.setContentsMargins(12, 12, 12, 12)
+        self.chat_stream_layout.setSpacing(10)
+        self.chat_stream_layout.addStretch(1)
+        self.chat_scroll.setWidget(self.chat_stream_widget)
+        left_layout.addWidget(self.chat_scroll, 1)
+
+        input_wrap = QFrame(left)
+        input_wrap.setObjectName("subCard")
+        input_layout = QHBoxLayout(input_wrap)
+        input_layout.setContentsMargins(10, 10, 10, 10)
+        input_layout.setSpacing(8)
+        self.chat_input = ChatInputTextEdit(input_wrap)
+        self.chat_input.setObjectName("chatInput")
+        self.chat_input.setPlaceholderText("输入问题，Enter 发送，Shift+Enter 换行")
+        self.chat_input.setMinimumHeight(78)
+        self.chat_input.setMaximumHeight(140)
+        self.chat_input.send_requested.connect(self._on_send_chat)
+        input_layout.addWidget(self.chat_input, 1)
+        self.chat_send_btn = QPushButton("发送", input_wrap)
+        self.chat_send_btn.setObjectName("accentButton")
+        self.chat_send_btn.setFixedWidth(92)
+        self.chat_send_btn.clicked.connect(self._on_send_chat)
+        input_layout.addWidget(self.chat_send_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        left_layout.addWidget(input_wrap, 0)
+
+        right = QFrame(page)
+        right.setObjectName("card")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 14, 16, 14)
+        right_layout.setSpacing(8)
+        layout.addWidget(right, 4)
+        tips_title = QLabel("快捷提示", right)
+        tips_title.setObjectName("sectionTitle")
+        right_layout.addWidget(tips_title, 0)
+        for tip in ["总结最新日志", "解释识别失败原因", "如何提升OCR效果", "生成排障清单"]:
+            btn = QPushButton(f"⚡ {tip}", right)
+            btn.setObjectName("secondaryButton")
+            btn.clicked.connect(lambda _=False, t=tip: self._insert_prompt(t))
+            right_layout.addWidget(btn, 0)
+        right_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+
+        self._reset_chat_ui()
+        return page
+
+    def _build_setting_page(self):
+        page = QWidget(self.page_stack)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        card = QFrame(page)
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(10)
+        title = QLabel("凭证设置", card)
+        title.setObjectName("sectionTitle")
+        card_layout.addWidget(title, 0)
+
+        form = QFrame(card)
+        form.setObjectName("subCard")
+        form_layout = QVBoxLayout(form)
+        form_layout.setContentsMargins(14, 12, 14, 12)
+        form_layout.setSpacing(10)
+
+        glm_label = QLabel("GLM API Key", form)
+        glm_label.setObjectName("dimLabel")
+        form_layout.addWidget(glm_label, 0)
+        self.glm_key_edit = QLineEdit(form)
+        self.glm_key_edit.setObjectName("keyLineEdit")
+        self.glm_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.glm_key_edit.setPlaceholderText("请输入 GLM API Key")
+        form_layout.addWidget(self.glm_key_edit, 0)
+
+        deepseek_label = QLabel("DeepSeek API Key", form)
+        deepseek_label.setObjectName("dimLabel")
+        form_layout.addWidget(deepseek_label, 0)
+        self.deepseek_key_edit = QLineEdit(form)
+        self.deepseek_key_edit.setObjectName("keyLineEdit")
+        self.deepseek_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepseek_key_edit.setPlaceholderText("请输入 DeepSeek API Key")
+        form_layout.addWidget(self.deepseek_key_edit, 0)
+
+        save_btn = QPushButton("保存配置", form)
+        save_btn.setObjectName("accentButton")
+        save_btn.clicked.connect(self._on_save_api_settings)
+        form_layout.addWidget(save_btn, 0)
+
+        tip = QLabel("提示：保存后将用于单据处理与AI助手请求。", form)
+        tip.setObjectName("dimLabel")
+        form_layout.addWidget(tip, 0)
+
+        card_layout.addWidget(form, 0)
+        card_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+        layout.addWidget(card, 1)
+        self._load_api_settings_to_inputs()
+        return page
+
+    def _get_saved_api_keys(self):
+        glm_key = str(self.settings.value("api/glm_key", "", str) or "").strip()
+        deepseek_key = str(self.settings.value("api/deepseek_key", "", str) or "").strip()
+        return glm_key, deepseek_key
+
+    def _load_api_settings_to_inputs(self):
+        if not hasattr(self, "glm_key_edit") or not hasattr(self, "deepseek_key_edit"):
+            return
+        glm_key, deepseek_key = self._get_saved_api_keys()
+        self.glm_key_edit.setText(glm_key)
+        self.deepseek_key_edit.setText(deepseek_key)
+
+    def _persist_api_keys(self, glm_key: str, deepseek_key: str):
+        self.settings.setValue("api/glm_key", (glm_key or "").strip())
+        self.settings.setValue("api/deepseek_key", (deepseek_key or "").strip())
+        self.settings.sync()
+
+    def _require_api_keys(self, need_deepseek: bool):
+        glm_key, deepseek_key = self._get_saved_api_keys()
+        if not glm_key:
+            self._append_log("[配置缺失] 请先在设置页配置 GLM API Key")
+            QMessageBox.warning(self, "缺少凭证", "请先到【设置】页面填写并保存 GLM API Key。")
+            return None, None
+        if need_deepseek and not deepseek_key:
+            self._append_log("[配置缺失] 请先在设置页配置 DeepSeek API Key")
+            QMessageBox.warning(self, "缺少凭证", "请先到【设置】页面填写并保存 DeepSeek API Key。")
+            return None, None
+        return glm_key, deepseek_key
+
+    def _on_save_api_settings(self):
+        if not hasattr(self, "glm_key_edit") or not hasattr(self, "deepseek_key_edit"):
+            return
+        glm_key = self.glm_key_edit.text().strip()
+        deepseek_key = self.deepseek_key_edit.text().strip()
+        self._persist_api_keys(glm_key, deepseek_key)
+        self.chat_assistant = None
+        self._chat_api_key = ""
+        self._append_log("[设置] API 凭证已保存")
+        QMessageBox.information(self, "保存成功", "API 凭证已保存。")
+
+    def _load_templates(self):
+        names = self.template_manager.get_template_names()
+        self.template_combo.clear()
+        self.template_combo.addItems(names)
+        default_name = self.template_manager.get_default_name()
+        if default_name:
+            idx = self.template_combo.findText(default_name)
+            if idx >= 0:
+                self.template_combo.setCurrentIndex(idx)
+
+    def _on_add_custom_template(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择自定义模板文件",
+            "",
+            "Excel 模板 (*.xls *.xlsx);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        try:
+            self.template_manager.add_custom_template(name, path)
+            self._load_templates()
+            idx = self.template_combo.findText(name)
+            if idx >= 0:
+                self.template_combo.setCurrentIndex(idx)
+            self._append_log(f"[模板] 已添加自定义模板：{name}")
+        except Exception as e:
+            QMessageBox.critical(self, "添加模板失败", str(e))
+
+    def _on_pick_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择单据文件（可多选）",
+            "",
+            "支持的文件 (*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.xlsx *.xls *.csv);;图片文件 (*.jpg *.jpeg *.png *.bmp *.webp *.tiff);;Excel 文件 (*.xlsx *.xls *.csv);;所有文件 (*.*)",
         )
         if paths:
-            self._add_files(list(paths))
+            self._add_files(paths)
 
-    def _add_files(self, paths: list):
-        """将文件添加到列表（去重）"""
+    def _add_files(self, paths):
         added = 0
         for p in paths:
-            if p not in self.selected_files:
-                self.selected_files.append(p)
-                added += 1
+            p = os.path.abspath(p)
+            if not os.path.isfile(p):
+                continue
+            ext = os.path.splitext(p)[-1].lower()
+            if ext not in ALL_EXTS:
+                continue
+            if p in self._selected_file_set:
+                continue
+            self._selected_file_set.add(p)
+            self.selected_files.append(p)
+            item = QListWidgetItem(self._format_file_item_text(p))
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            self.file_list.addItem(item)
+            added += 1
+        if added:
+            self._append_log(f"[选择文件] 新增 {added} 个文件，共 {len(self.selected_files)} 个")
+            self._update_file_stats()
+            if self.file_list.currentItem() is None and self.file_list.count() > 0:
+                self.file_list.setCurrentRow(self.file_list.count() - 1)
 
-        self._refresh_file_list()
-        self._log(f"[选择文件] 新增 {added} 个文件，共 {len(self.selected_files)} 个", color="info")
-        self._set_status(f"已选 {len(self.selected_files)} 个文件", color=CLR_SUCCESS)
-
-        # 预览最后一张图片
-        for p in reversed(paths):
-            if os.path.splitext(p)[-1].lower() in IMG_EXTS:
-                self._show_preview(p)
-                break
+    def _format_file_item_text(self, path: str):
+        ext = os.path.splitext(path)[-1].lower()
+        icon = "🧾" if ext in IMG_EXTS else "📊"
+        return f"{icon} {os.path.basename(path)}"
 
     def _on_clear_files(self):
-        """清空文件列表"""
+        if self._processing:
+            return
+        self.file_list.clear()
         self.selected_files.clear()
-        self._refresh_file_list()
-        self.file_count_label.configure(text="尚未选择文件", text_color=CLR_TEXT_DIM)
-        self.preview_label.configure(
-            text="请先选择单据图片\n\n支持拖拽或点击按钮上传",
-            image=None,
-        )
-        self._set_status("就绪", color=CLR_TEXT_DIM)
-        self._log("[清空] 已清空文件列表")
+        self._selected_file_set.clear()
+        self._preview_path = ""
+        self._preview_source = QPixmap()
+        self.preview_label.setText("请选择图片文件进行预览")
+        self.preview_label.setPixmap(QPixmap())
+        self._update_file_stats()
+        self._append_log("[清空] 已清空文件列表")
 
-    def _refresh_file_list(self):
-        """刷新文件列表 UI"""
-        # 清空旧列表
-        for w in self.file_list_frame.winfo_children():
-            w.destroy()
-
-        for i, path in enumerate(self.selected_files):
-            fname = os.path.basename(path)
-            ext   = os.path.splitext(path)[-1].lower()
-            icon  = "📊" if ext in EXCEL_EXTS else "🖼"
-            color = CLR_WARNING if ext in EXCEL_EXTS else CLR_TEXT
-
-            row = ctk.CTkFrame(self.file_list_frame, fg_color="transparent")
-            row.pack(fill="x", pady=1)
-
-            ctk.CTkLabel(
-                row, text=f"{icon} {i+1:02d}. {fname}",
-                font=FONT_SMALL, text_color=color, anchor="w",
-            ).pack(side="left", fill="x", expand=True)
-
-            # 删除单个文件按钮
-            p = path
-            ctk.CTkButton(
-                row, text="✕",
-                font=FONT_SMALL, width=24, height=20,
-                fg_color="transparent", hover_color=CLR_ERROR,
-                text_color=CLR_TEXT_DIM, corner_radius=4,
-                command=lambda fp=p: self._remove_file(fp),
-            ).pack(side="right", padx=2)
-
-        n = len(self.selected_files)
-        if n == 0:
-            self.file_count_label.configure(text="尚未选择文件", text_color=CLR_TEXT_DIM)
-        else:
-            img_cnt   = sum(1 for p in self.selected_files if os.path.splitext(p)[-1].lower() in IMG_EXTS)
-            excel_cnt = n - img_cnt
-            parts = []
-            if img_cnt:   parts.append(f"{img_cnt} 张图片")
-            if excel_cnt: parts.append(f"{excel_cnt} 个 Excel")
-            self.file_count_label.configure(
-                text=f"✅  已选 {n} 个文件：{'、'.join(parts)}",
-                text_color=CLR_SUCCESS,
-            )
-
-
-    def _remove_file(self, path: str):
-        """从列表中移除单个文件"""
+    def _on_remove_selected_file(self):
+        if self._processing:
+            return
+        item = self.file_list.currentItem()
+        if not item:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        row = self.file_list.row(item)
+        self.file_list.takeItem(row)
+        if path in self._selected_file_set:
+            self._selected_file_set.remove(path)
         if path in self.selected_files:
             self.selected_files.remove(path)
-        self._refresh_file_list()
-        self._set_status(f"已选 {len(self.selected_files)} 个文件", color=CLR_SUCCESS if self.selected_files else CLR_TEXT_DIM)
+        if self._preview_path == path:
+            self._preview_path = ""
+            self._preview_source = QPixmap()
+            self.preview_label.setText("请选择图片文件进行预览")
+            self.preview_label.setPixmap(QPixmap())
+        self._update_file_stats()
+        self._append_log(f"[移除] {os.path.basename(path)}")
 
-    # ─────────────────────────────────────────────
-    # 手写体开关回调
-    # ─────────────────────────────────────────────
-    def _on_hw_toggle(self):
-        """手写体识别开关回调，更新描述文字"""
-        if self.handwriting_var.get():
-            self.hw_desc_label.configure(
-                text="开启：优先识别手写修改内容，手写与印刷冲突时以手写为准",
-                text_color=CLR_ACCENT2,
-            )
-            self._log("[选项] 手写体识别已开启", color="info")
-        else:
-            self.hw_desc_label.configure(
-                text="关闭：仅识别印刷文字",
-                text_color=CLR_TEXT_DIM,
-            )
-            self._log("[选项] 手写体识别已关闭")
+    def _update_file_stats(self):
+        n = len(self.selected_files)
+        if n == 0:
+            self.file_stats_label.setText("尚未选择文件")
+            return
+        img_n = sum(1 for p in self.selected_files if os.path.splitext(p)[-1].lower() in IMG_EXTS)
+        excel_n = n - img_n
+        parts = []
+        if img_n:
+            parts.append(f"{img_n} 张图片")
+        if excel_n:
+            parts.append(f"{excel_n} 个表格")
+        self.file_stats_label.setText(f"已选 {n} 个文件：{'、'.join(parts)}")
 
-    # ─────────────────────────────────────────────
-    # 开始处理
-    # ─────────────────────────────────────────────
+    def _on_file_selection_changed(self):
+        item = self.file_list.currentItem()
+        if not item:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        ext = os.path.splitext(path)[-1].lower()
+        if ext not in IMG_EXTS:
+            self._preview_path = ""
+            self._preview_source = QPixmap()
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("当前选中为 Excel/CSV，无法图片预览")
+            return
+        self._load_preview_source(path)
+        self._render_preview()
+
+    def _load_preview_source(self, path: str):
+        if path == self._preview_path and not self._preview_source.isNull():
+            return
+        pix = QPixmap(path)
+        if pix.isNull():
+            self._preview_path = ""
+            self._preview_source = QPixmap()
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("图片加载失败")
+            return
+        self._preview_path = path
+        self._preview_source = pix
+
+    def _render_preview(self):
+        if self._preview_source.isNull():
+            return
+        w = max(120, self.preview_label.width() - 12)
+        h = max(120, self.preview_label.height() - 12)
+        scaled = self._preview_source.scaled(
+            w,
+            h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setText("")
+        self.preview_label.setPixmap(scaled)
+
     def _on_start_process(self):
-        """开始批量 AI 处理"""
-        if self.is_processing:
-            self._log("[警告] 正在处理中，请等待...", color="warn")
+        if self._processing:
             return
-
         if not self.selected_files:
-            messagebox.showwarning(
-                "未选择文件",
-                "请先选择至少一个单据文件！\n（图片或 Excel 均可）",
-            )
+            QMessageBox.warning(self, "未选择文件", "请先选择至少一个单据文件。")
+            return
+        glm_key, deepseek_key = self._require_api_keys(need_deepseek=True)
+        if not glm_key or not deepseek_key:
+            return
+        tpl_name = self.template_combo.currentText().strip()
+        if not tpl_name:
+            QMessageBox.warning(self, "模板缺失", "未检测到可用模板，请先添加模板。")
+            return
+        try:
+            tpl_path = self.template_manager.get_template_path(tpl_name)
+        except Exception as e:
+            QMessageBox.critical(self, "模板错误", str(e))
             return
 
-        self.is_processing = True
-        self.output_excel_paths = []
-        self._set_status("正在处理...", color=CLR_ACCENT)
-        self._progress(0.03, "初始化中...")
-
-        thread = threading.Thread(target=self._run_batch_process, daemon=True)
-        thread.start()
-
-    def _run_batch_process(self):
-        """后台批量处理线程"""
-        try:
-            process_images_batch = _ocr_process_batch
-
-            files       = list(self.selected_files)
-            total       = len(files)
-            handwriting = self.handwriting_var.get()
-            merge       = self.merge_var.get()
-
-            # 获取当前选中的模板路径
-            tpl_name = self.template_var.get()
-            try:
-                tpl_path = self.template_manager.get_template_path(tpl_name)
-            except Exception:
-                tpl_path = None   # 回退到 ocr_to_excel 内置默认路径
-
-            # 输出目录：与第一个文件同目录
-            output_dir = os.path.dirname(os.path.abspath(files[0]))
-            # 合并路径传 None，由后端根据 AI 提取的供应商/日期智能命名
-            merged_path = None
-
-            def log_cb(msg: str):
-                self.after(0, lambda m=msg: self._log(m))
-
-            def progress_cb(current: int, total_n: int):
-                """current = 0-based index of the file just finished"""
-                pct = 0.05 + 0.90 * (current / max(total_n, 1))
-                label = f"正在处理第 {current+1}/{total_n} 个文件..."
-                self.after(0, lambda p=pct, l=label: self._progress(p, l))
-
-            result_paths = process_images_batch(
-                image_paths=files,
-                output_dir=output_dir,
-                log_callback=log_cb,
-                handwriting=handwriting,
-                merge_output=merge,
-                merged_output_path=merged_path,
-                progress_callback=progress_cb,
-                template_path=tpl_path,
-            )
-
-            self.output_excel_paths = result_paths
-            self.after(0, lambda: self._on_batch_success(result_paths, total))
-
-        except Exception as e:
-            err_msg = str(e)
-            self.after(0, lambda: self._on_process_error(err_msg))
-
-    def _on_batch_success(self, result_paths: list, total_files: int):
-        """批量处理成功回调（主线程）"""
-        self.is_processing = False
-        self._progress(1.0, "完成！")
-
-        n = len(result_paths)
-        names = [os.path.basename(p) for p in result_paths]
-
-        self._log(
-            f"\n🎉  批量处理完成！共处理 {total_files} 个文件，生成 {n} 个输出文件:",
-            color="success",
+        output_dir = os.path.dirname(os.path.abspath(self.selected_files[0]))
+        self._worker = BatchWorker(
+            image_paths=self.selected_files,
+            output_dir=output_dir,
+            handwriting=self.handwriting_check.isChecked(),
+            merge_output=self.merge_check.isChecked(),
+            template_path=tpl_path,
+            glm_api_key=glm_key,
+            deepseek_api_key=deepseek_key,
         )
-        for p in result_paths:
-            self._log(f"    📄 {p}", color="success")
-            self._add_history(os.path.basename(p), p)
+        self._worker.progress_update.connect(self._on_worker_progress)
+        self._worker.log_message.connect(self._append_log)
+        self._worker.task_finished.connect(self._on_worker_finished)
+        self._worker.task_failed.connect(self._on_worker_failed)
+        self._set_processing(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("初始化中...")
+        self._append_log(f"[任务] 开始处理，模板={tpl_name}")
+        self._worker.start()
 
-        self._set_status(f"✅ 完成！生成 {n} 个文件", color=CLR_SUCCESS)
+    def _set_processing(self, processing: bool):
+        self._processing = processing
+        self.start_btn.setEnabled(not processing)
+        self.pick_files_btn.setEnabled(not processing)
+        self.clear_files_btn.setEnabled(not processing)
+        self.remove_selected_btn.setEnabled(not processing)
+        self.template_combo.setEnabled(not processing)
+        self.handwriting_check.setEnabled(not processing)
+        self.merge_check.setEnabled(not processing)
+        if not self._ai_busy:
+            self.sidebar_status.setText("状态：处理中" if processing else f"状态：{self._active_route}")
 
-        summary = "\n".join(f"  • {nm}" for nm in names[:10])
-        if n > 10:
-            summary += f"\n  ... 共 {n} 个文件"
+    def _on_worker_progress(self, current: int, total: int):
+        total = max(1, total)
+        pct = int((current / total) * 100)
+        self.progress_bar.setValue(max(0, min(100, pct)))
+        self.progress_label.setText(f"正在处理第 {current}/{total} 个文件...")
 
-        messagebox.showinfo(
-            "处理完成",
-            f"成功处理 {total_files} 个文件！\n\n输出文件：\n{summary}\n\n点击【打开 Excel】可查看最近生成的文件。",
-        )
+    def _on_worker_finished(self, paths):
+        self._set_processing(False)
+        self.output_excel_paths = list(paths)
+        self.progress_bar.setValue(100)
+        self.progress_label.setText("处理完成")
+        self._append_log(f"[完成] 生成 {len(self.output_excel_paths)} 个输出文件")
+        names = "\n".join([os.path.basename(p) for p in self.output_excel_paths[:8]])
+        if len(self.output_excel_paths) > 8:
+            names += f"\n... 共 {len(self.output_excel_paths)} 个"
+        QMessageBox.information(self, "处理完成", f"识别任务已完成。\n\n输出文件：\n{names}")
+        self._worker = None
 
-    def _on_process_error(self, err_msg: str):
-        """处理失败回调（主线程）"""
-        self.is_processing = False
-        self._progress(0, "")
-        self._log(f"\n❌  处理失败: {err_msg}", color="error")
-        self._set_status(f"❌ 失败: {err_msg[:60]}", color=CLR_ERROR)
-        messagebox.showerror("处理失败", f"发生错误：\n\n{err_msg}")
+    def _on_worker_failed(self, msg: str):
+        self._set_processing(False)
+        self.progress_label.setText("处理失败")
+        self._append_log(f"[失败] {msg}")
+        QMessageBox.critical(self, "处理失败", msg)
+        self._worker = None
 
     def _on_open_output(self):
-        """打开最后生成的 Excel 文件"""
         if not self.output_excel_paths:
-            messagebox.showinfo("提示", "尚未生成 Excel 文件，请先完成识别步骤。")
+            QMessageBox.information(self, "提示", "尚未生成输出文件，请先完成识别。")
             return
-
-        if len(self.output_excel_paths) == 1:
-            p = self.output_excel_paths[0]
-            if os.path.exists(p):
-                os.startfile(p)
-            else:
-                messagebox.showerror("错误", f"文件不存在:\n{p}")
-        else:
-            # 多个文件：弹出选择框
-            names = [os.path.basename(p) for p in self.output_excel_paths]
-            win = ctk.CTkToplevel(self)
-            win.title("选择要打开的文件")
-            win.geometry("460x380")
-            win.grab_set()
-            win.configure(fg_color=CLR_BG)
-
-            ctk.CTkLabel(
-                win, text="请选择要打开的输出文件：",
-                font=FONT_BODY, text_color=CLR_TEXT,
-            ).pack(pady=(20, 10), padx=20)
-
-            scroll = ctk.CTkScrollableFrame(win, fg_color=CLR_CARD, corner_radius=10)
-            scroll.pack(fill="both", expand=True, padx=20, pady=(0, 10))
-
-            for p in self.output_excel_paths:
-                nm = os.path.basename(p)
-                fp = p
-                ctk.CTkButton(
-                    scroll, text=f"📊  {nm}",
-                    font=FONT_SMALL, anchor="w",
-                    fg_color=CLR_CARD2, hover_color=CLR_BORDER,
-                    text_color=CLR_TEXT, corner_radius=6,
-                    command=lambda path=fp: (
-                        os.startfile(path) if os.path.exists(path) else None
-                    ),
-                ).pack(fill="x", padx=8, pady=3)
-
-            ctk.CTkButton(
-                win, text="关闭",
-                font=FONT_BODY, width=100,
-                fg_color=CLR_BORDER, hover_color="#3a3d50",
-                text_color=CLR_TEXT_DIM,
-                command=win.destroy,
-            ).pack(pady=10)
-
-    # ─────────────────────────────────────────────
-    # UI 辅助方法
-    # ─────────────────────────────────────────────
-    def _show_preview(self, image_path: str):
-        """在预览区显示图片缩略图"""
         try:
-            img = Image.open(image_path)
-            max_w, max_h = 400, 190
-            img.thumbnail((max_w, max_h), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
-            self.preview_label.configure(image=photo, text="")
-            self.preview_label._image = photo  # 防止被 GC
+            if len(self.output_excel_paths) == 1:
+                os.startfile(self.output_excel_paths[0])
+                self._append_log(f"[打开] {self.output_excel_paths[0]}")
+                return
+            parent_dir = os.path.dirname(self.output_excel_paths[0])
+            os.startfile(parent_dir)
+            self._append_log(f"[打开目录] {parent_dir}")
+            QMessageBox.information(self, "已打开目录", "已为你打开输出目录。")
         except Exception as e:
-            self.preview_label.configure(text=f"预览失败: {e}", image=None)
+            QMessageBox.critical(self, "打开失败", str(e))
 
-    def _log(self, msg: str, color: str = "normal"):
-        """向日志框追加一行文字"""
-        self.log_box.configure(state="normal")
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}\n"
-        self.log_box.insert("end", line)
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+    def _get_chat_assistant(self, api_key: str):
+        api_key = (api_key or "").strip()
+        if self.chat_assistant is None or self._chat_api_key != api_key:
+            self.chat_assistant = GLMChatAssistant(
+                api_key=api_key,
+                model="glm-5",
+                system_prompt="你是本软件的AI对话助手。请使用中文，回答准确、简洁、可执行。",
+            )
+            self._chat_api_key = api_key
+        return self.chat_assistant
 
-    def _clear_log(self):
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
+    def send_ai_message(self, user_message: str, api_key: str) -> str:
+        assistant = self._get_chat_assistant(api_key)
+        return assistant.send_message(user_message)
 
-    def _set_status(self, text: str, color: str = CLR_TEXT_DIM):
-        self.status_dot.configure(text_color=color)
-        self.status_text.configure(text=text, text_color=color)
+    def send_ai_message_async(self, user_message: str, api_key: str, on_success=None, on_error=None):
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            raise RuntimeError("AI助手正在处理上一条消息")
+        self._ai_worker = AIChatWorker(self.send_ai_message, user_message, api_key)
+        if on_success:
+            self._ai_worker.response_ready.connect(on_success)
+        if on_error:
+            self._ai_worker.task_failed.connect(on_error)
+        self._ai_worker.finished.connect(self._on_ai_worker_finished)
+        self._ai_worker.start()
 
-    def _progress(self, value: float, label: str = ""):
-        self.progress_bar.set(value)
-        self.progress_label.configure(text=label)
+    def reset_ai_conversation(self, api_key: str):
+        assistant = self._get_chat_assistant(api_key)
+        assistant.reset()
 
-    def _add_history(self, filename: str, filepath: str):
-        """在历史区添加一条记录"""
-        ts = datetime.datetime.now().strftime("%m/%d %H:%M")
+    def _insert_prompt(self, text: str):
+        if not hasattr(self, "chat_input"):
+            return
+        if self._ai_busy:
+            return
+        current = self.chat_input.toPlainText().strip()
+        self.chat_input.setPlainText(f"{current}\n{text}".strip())
+        self.chat_input.moveCursor(QTextCursor.MoveOperation.End)
+        self.chat_input.setFocus()
 
-        row = ctk.CTkFrame(self.history_frame, fg_color=CLR_CARD2, corner_radius=8)
-        row.pack(fill="x", pady=2)
+    def _append_chat_bubble(self, role: str, text: str, loading: bool = False):
+        row = QWidget(self.chat_stream_widget)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(10)
+        bubble = ChatBubbleWidget(role, text, loading=loading, parent=row)
+        if role == "user":
+            row_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
+            row_layout.addWidget(bubble, 0, Qt.AlignmentFlag.AlignRight)
+        else:
+            row_layout.addWidget(bubble, 0, Qt.AlignmentFlag.AlignLeft)
+            row_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
+        insert_index = max(0, self.chat_stream_layout.count() - 1)
+        self.chat_stream_layout.insertWidget(insert_index, row)
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
+        return bubble
 
-        ctk.CTkLabel(
-            row,
-            text=f"📄  {filename}",
-            font=FONT_SMALL, text_color=CLR_TEXT, anchor="w",
-        ).pack(side="left", padx=10, pady=6, fill="x", expand=True)
+    def _scroll_chat_to_bottom(self):
+        bar = self.chat_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
-        ctk.CTkLabel(
-            row, text=ts,
-            font=FONT_SMALL, text_color=CLR_TEXT_DIM,
-        ).pack(side="right", padx=10)
+    def _reset_chat_ui(self):
+        while self.chat_stream_layout.count() > 1:
+            item = self.chat_stream_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._pending_ai_bubble = None
+        self._append_chat_bubble("ai", "你好，我是 AI 对话助手。你可以问我识别流程、模板配置和异常排查。")
 
-        fp = filepath
-        row.bind("<Button-1>", lambda e: os.startfile(fp) if os.path.exists(fp) else None)
-        row.configure(cursor="hand2")
-
-
-# ─────────────────────────────────────────────
-# 程序入口
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    # ── 高 DPI 适配（防止 Windows 自动位图缩放导致文字模糊）──
-    try:
-        import ctypes
-        # Per-Monitor DPI Aware V2（Windows 10 1703+）
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
+    def _on_send_chat(self):
+        if self._ai_busy:
+            return
+        text = self.chat_input.toPlainText().strip()
+        if not text:
+            return
+        glm_key, _ = self._require_api_keys(need_deepseek=False)
+        if not glm_key:
+            return
+        self.chat_input.clear()
+        self._append_chat_bubble("user", text)
+        self._pending_ai_bubble = self._append_chat_bubble("ai", "正在思考...")
+        self._append_log(f"[AI助手][用户] {text}")
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+            self.send_ai_message_async(
+                text,
+                api_key=glm_key,
+                on_success=self._on_ai_response_success,
+                on_error=self._on_ai_response_error,
+            )
+            self._set_ai_busy(True)
+        except Exception as e:
+            self._on_ai_response_error(str(e))
 
-    app = App()
-    app.mainloop()
+    def _set_ai_busy(self, busy: bool):
+        self._ai_busy = busy
+        self.chat_send_btn.setEnabled(not busy)
+        self.chat_input.setEnabled(not busy)
+        self.chat_reset_btn.setEnabled(not busy)
+        if not self._processing:
+            self.sidebar_status.setText("状态：AI思考中" if busy else f"状态：{self._active_route}")
+
+    def _on_ai_response_success(self, answer: str):
+        if self._pending_ai_bubble is not None:
+            self._pending_ai_bubble.set_message(answer)
+        else:
+            self._append_chat_bubble("ai", answer)
+        self._append_log(f"[AI助手] {answer}")
+        self._set_ai_busy(False)
+
+    def _on_ai_response_error(self, msg):
+        err = str(msg)
+        text = f"调用失败：{err}"
+        if self._pending_ai_bubble is not None:
+            self._pending_ai_bubble.set_message(text)
+        else:
+            self._append_chat_bubble("ai", text)
+        self._append_log(f"[AI助手][错误] {err}")
+        self._set_ai_busy(False)
+        QMessageBox.critical(self, "AI 调用失败", err)
+
+    def _on_ai_worker_finished(self):
+        if self._ai_busy:
+            self._set_ai_busy(False)
+        self._pending_ai_bubble = None
+        self._ai_worker = None
+
+    def _on_reset_chat(self):
+        if self._ai_busy:
+            return
+        glm_key, _ = self._require_api_keys(need_deepseek=False)
+        if not glm_key:
+            self._reset_chat_ui()
+            return
+        try:
+            self.reset_ai_conversation(glm_key)
+            self._reset_chat_ui()
+            self._append_log("[AI助手] 对话已重置")
+        except Exception as e:
+            QMessageBox.critical(self, "重置失败", str(e))
+
+    def _toggle_log_drawer(self):
+        self._log_collapsed = not self._log_collapsed
+        self.log_box.setVisible(not self._log_collapsed)
+        self.log_toggle_btn.setText("展开" if self._log_collapsed else "收起")
+
+    def _append_log(self, message: str):
+        ts = QDateTime.currentDateTime().toString("HH:mm:ss")
+        self._log_buffer.append(f"[{ts}] {message}")
+        if not self._log_flush_timer.isActive():
+            self._log_flush_timer.start()
+
+    def _flush_log_buffer(self):
+        if not self._log_buffer:
+            return
+        chunk = "\n".join(self._log_buffer) + "\n"
+        self._log_buffer.clear()
+        self.log_box.insertPlainText(chunk)
+        self.log_box.moveCursor(QTextCursor.MoveOperation.End)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_timer.start()
+
+    def _on_resize_stable(self):
+        self.window_size_label.setText(f"窗口: {self.width()} × {self.height()}")
+        self._render_preview()
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            f"""
+            QWidget {{
+                background-color: {CLR_BG};
+                color: {CLR_TEXT};
+                font-family: "Microsoft YaHei UI";
+                font-size: 13px;
+            }}
+            #sidebar {{
+                background-color: {CLR_CARD};
+                border: none;
+                border-radius: 12px;
+            }}
+            #topBar {{
+                background-color: {CLR_CARD};
+                border: none;
+                border-radius: 12px;
+            }}
+            #logDrawer {{
+                background-color: {CLR_CARD};
+                border: none;
+            }}
+            #brandCard {{
+                background-color: {CLR_CARD2};
+                border: none;
+                border-radius: 10px;
+            }}
+            #brandTitle {{
+                color: #ffffff;
+                font-size: 20px;
+                font-weight: 700;
+            }}
+            #pageTitle {{
+                color: #ffffff;
+                font-size: 22px;
+                font-weight: 700;
+            }}
+            #sectionTitle {{
+                color: {CLR_TEXT};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            #dimLabel {{
+                color: {CLR_TEXT_DIM};
+                font-size: 12px;
+            }}
+            #divider {{
+                background-color: {CLR_BORDER};
+                border: none;
+            }}
+            #card {{
+                background-color: {CLR_CARD};
+                border: none;
+                border-radius: 12px;
+            }}
+            #subCard {{
+                background-color: {CLR_CARD2};
+                border: none;
+                border-radius: 10px;
+            }}
+            #pageStack {{
+                background: transparent;
+                border: none;
+            }}
+            #logBox, #fileList, #comboBox {{
+                background-color: {CLR_CARD2};
+                border: 1px solid {CLR_BORDER};
+                border-radius: 10px;
+                color: #a8b4c8;
+                selection-background-color: {CLR_ACCENT};
+            }}
+            #chatScroll {{
+                background-color: {CLR_CARD2};
+                border: 1px solid {CLR_BORDER};
+                border-radius: 10px;
+            }}
+            #chatInput {{
+                background-color: {CLR_CARD2};
+                border: 1px solid {CLR_BORDER};
+                border-radius: 8px;
+                color: {CLR_TEXT};
+                padding: 6px;
+            }}
+            #chatBubbleUser {{
+                background-color: {CLR_ACCENT};
+                border: none;
+                border-radius: 12px;
+            }}
+            #chatBubbleAI {{
+                background-color: #2a2f45;
+                border: none;
+                border-radius: 12px;
+            }}
+            #chatBubbleText {{
+                color: #ffffff;
+                font-size: 13px;
+                line-height: 1.35;
+            }}
+            #comboBox {{
+                min-height: 32px;
+                padding-left: 8px;
+            }}
+            #previewLabel {{
+                background-color: {CLR_CARD2};
+                border: 1px dashed {CLR_BORDER};
+                border-radius: 8px;
+                color: {CLR_TEXT_DIM};
+            }}
+            #logToggleButton {{
+                background-color: {CLR_BORDER};
+                border: none;
+                border-radius: 6px;
+                color: {CLR_TEXT};
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            #logToggleButton:hover {{
+                background-color: #3a3d50;
+            }}
+            #navButton {{
+                text-align: left;
+                padding-left: 12px;
+                background-color: {CLR_CARD};
+                border: none;
+                border-radius: 8px;
+                color: {CLR_TEXT_DIM};
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            #navButton:hover {{
+                background-color: {CLR_CARD2};
+            }}
+            #navButton[active="true"] {{
+                background-color: {CLR_ACCENT};
+                color: #ffffff;
+            }}
+            QTextEdit, QListWidget {{
+                background-color: {CLR_CARD2};
+                border: 1px solid {CLR_BORDER};
+                border-radius: 8px;
+                color: {CLR_TEXT};
+            }}
+            QLineEdit {{
+                background-color: {CLR_CARD2};
+                border: 1px solid {CLR_BORDER};
+                border-radius: 8px;
+                color: {CLR_TEXT};
+                min-height: 34px;
+                padding: 0 10px;
+            }}
+            QProgressBar {{
+                background-color: {CLR_BORDER};
+                border: none;
+                border-radius: 4px;
+                min-height: 8px;
+                max-height: 8px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {CLR_ACCENT};
+                border-radius: 4px;
+            }}
+            QPushButton {{
+                background-color: {CLR_CARD2};
+                border: none;
+                border-radius: 8px;
+                color: {CLR_TEXT};
+                min-height: 34px;
+                padding: 0 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: {CLR_BORDER};
+            }}
+            #accentButton {{
+                background-color: {CLR_ACCENT2};
+                color: #ffffff;
+            }}
+            #accentButton:hover {{
+                background-color: #6656d8;
+            }}
+            #successButton {{
+                background-color: {CLR_SUCCESS};
+                color: #ffffff;
+            }}
+            #successButton:hover {{
+                background-color: #1ba950;
+            }}
+            #secondaryButton {{
+                text-align: left;
+                background-color: {CLR_CARD2};
+                color: {CLR_TEXT};
+            }}
+            QCheckBox {{
+                color: {CLR_TEXT};
+                spacing: 8px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 1px solid {CLR_BORDER};
+                background: {CLR_CARD2};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {CLR_ACCENT};
+                border: 1px solid {CLR_ACCENT};
+            }}
+            """
+        )
+
+
+def _configure_qt_acceleration():
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    fmt = QSurfaceFormat()
+    fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
+    fmt.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
+    fmt.setSwapInterval(1)
+    fmt.setSamples(4)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
+
+def main():
+    _configure_qt_acceleration()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
