@@ -7,7 +7,18 @@
 ![PySide6](https://img.shields.io/badge/Framework-PySide6-green.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
+
 > 解决手工录单自动化。支持多张单据一键拖入，AI 自动提取信息并匹配导出自定义模板 Excel 表格。
+
+## 🛠️ 快速上手
+
+1. **下载运行**：前往 [Releases](https://github.com/AgIzT/AI-Excel-Tool/releases) 下载最新的 `default.exe`。
+2. **配置密钥**：在软件左侧“设置”页填入你的 GLM 和 DeepSeek API Key。
+3. **开始录入**：将送货单图片直接拖入识别区。
+
+
+> 这个项目最初是为了帮家里厂子里减轻录单负担而开发的。如果你觉得这个工具或者这种‘AI + 传统行业’的思路对你有启发，欢迎点个 Star 支持一下！
+> 以下为更新日志
 
 
 #### 🏁 **v1.0.0 AI-Excel-Tool 更新日志 "Reforged"** - 架构重构
