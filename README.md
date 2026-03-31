@@ -5,9 +5,6 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![PySide6](https://img.shields.io/badge/Framework-PySide6-green.svg)
-![OCR](https://img.shields.io/badge/OCR-GLM--OCR-orange.svg)
-![LLM](https://img.shields.io/badge/LLM-GLM--5-red.svg)
-![LLM](https://img.shields.io/badge/LLM-DeepSeek--V3-red.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 > 解决手工录单转自动化。支持多张单据一键拖入，AI 自动提取信息并匹配导出自定义模板 Excel 表格。
