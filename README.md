@@ -1,6 +1,3 @@
-全自动单据入库系统 (AI-Excel-Tool) 更新日志.README
-
-\---
 ### 基于 AI 的全自动单据识别入库系统
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
