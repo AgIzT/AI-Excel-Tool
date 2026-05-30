@@ -1,26 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 workers.py
-后台线程：把批量识别放到 QThread，避免阻塞 UI。
+后台线程：把耗时的 AI 识别放到 QThread，避免阻塞 UI。
+只负责「识别」，导出在用户复核确认后由主线程执行（导出很快）。
 """
 
 from PySide6.QtCore import QThread, Signal
 
-from ocr_to_excel import process_images_batch
+from ocr_to_excel import extract_batch
 
 
-class BatchWorker(QThread):
+class ExtractWorker(QThread):
     progress_update = Signal(int, int)
     log_message = Signal(str)
-    task_finished = Signal(list)
+    extract_finished = Signal(object)   # 传出 extract_batch 的结果 dict
     task_failed = Signal(str)
 
-    def __init__(self, image_paths, output_dir, handwriting, merge_output, template_path, api_config):
+    def __init__(self, image_paths, handwriting, template_path, api_config):
         super().__init__()
         self._image_paths = list(image_paths)
-        self._output_dir = output_dir
         self._handwriting = bool(handwriting)
-        self._merge_output = bool(merge_output)
         self._template_path = template_path
         self._api_config = api_config
 
@@ -32,17 +31,14 @@ class BatchWorker(QThread):
             def progress_cb(current: int, total: int):
                 self.progress_update.emit(current + 1, total)
 
-            result = process_images_batch(
+            extraction = extract_batch(
                 image_paths=self._image_paths,
-                output_dir=self._output_dir,
                 log_callback=log_cb,
                 handwriting=self._handwriting,
-                merge_output=self._merge_output,
-                merged_output_path=None,
                 progress_callback=progress_cb,
                 template_path=self._template_path,
                 api_config=self._api_config,
             )
-            self.task_finished.emit(result)
+            self.extract_finished.emit(extraction)
         except Exception as e:
             self.task_failed.emit(str(e))

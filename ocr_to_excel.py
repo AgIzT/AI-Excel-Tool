@@ -339,20 +339,18 @@ def process_image(
     return output_path
 
 
-def process_images_batch(
+def extract_batch(
     image_paths: list,
-    output_dir: str,
     log_callback=None,
     handwriting: bool = False,
-    merge_output: bool = False,
-    merged_output_path: str = None,
     progress_callback=None,
     template_path: str = None,
     api_config: ApiConfig = None,
-) -> list:
+) -> dict:
     """
-    批量处理多个图片/表格。单个文件提取失败会被跳过并记录，不会写出误导性的空文件；
-    全部失败时抛出异常。返回成功生成的输出文件路径列表。
+    仅识别、不落盘：对每个文件调用模型提取 (records, meta)，供「导出前人工复核」使用。
+    返回 {"headers": [...], "items": [{"name","path","records","meta"}...], "failed": [(name,err)...]}。
+    单个文件提取失败会被跳过并记入 failed；全部失败时 items 为空（由调用方决定如何处理）。
     """
     def log(msg):
         print(msg)
@@ -360,16 +358,14 @@ def process_images_batch(
             log_callback(msg)
 
     total = len(image_paths)
-    log(f"[批量处理] 共 {total} 个文件，模式={'合并输出' if merge_output else '分别输出'}")
+    log(f"[批量识别] 共 {total} 个文件")
 
     _tpl_path = template_path or TEMPLATE_PATH
     log("\n[步骤 1] 读取模板表头...")
     headers = get_template_headers(_tpl_path)
     log(f"  → 共 {len(headers)} 个字段")
 
-    all_records = []
-    all_metas = []
-    all_output_paths = []
+    items = []
     failed = []
 
     for idx, image_path in enumerate(image_paths, start=1):
@@ -390,15 +386,38 @@ def process_images_batch(
             failed.append((fname, str(e)))
             continue
 
-        all_records.append(records)
-        all_metas.append(meta)
-        all_output_paths.append(_build_smart_filename(meta, output_dir))
+        items.append({"name": fname, "path": image_path, "records": records, "meta": meta})
 
     if progress_callback:
         progress_callback(total, total)
 
-    if not all_records:
-        raise RuntimeError(f"全部 {total} 个文件提取失败，未生成任何文件（详见日志）")
+    return {"headers": headers, "items": items, "failed": failed}
+
+
+def export_batch(
+    extraction: dict,
+    output_dir: str,
+    merge_output: bool = False,
+    merged_output_path: str = None,
+    log_callback=None,
+) -> list:
+    """
+    把（可能经人工复核修改过的）识别结果写成 Excel。
+    extraction 结构同 extract_batch 的返回值；仅使用其中的 headers 与 items。
+    输出文件名按各 item 的 meta 在导出时即时生成，因此用户改了供应商/日期会反映到文件名。
+    """
+    def log(msg):
+        print(msg)
+        if log_callback:
+            log_callback(msg)
+
+    headers = extraction["headers"]
+    items = extraction["items"]
+    if not items:
+        raise RuntimeError("没有可导出的记录")
+
+    all_records = [it["records"] for it in items]
+    all_metas = [it["meta"] for it in items]
 
     if merge_output:
         if not merged_output_path:
@@ -406,15 +425,61 @@ def process_images_batch(
         log(f"\n[合并导出] 将 {len(all_records)} 份数据合并...")
         export_merged_excel(all_records, headers, merged_output_path)
         log(f"  → {merged_output_path}")
-        result_paths = [merged_output_path]
-    else:
-        log(f"\n[分别导出] 生成 {len(all_output_paths)} 个文件...")
-        export_separate_excel(all_records, headers, all_output_paths)
-        for p in all_output_paths:
-            log(f"  → {p}")
-        result_paths = all_output_paths
+        return [merged_output_path]
 
-    ok = len(all_records)
+    log(f"\n[分别导出] 生成 {len(items)} 个文件...")
+    output_paths = [_build_smart_filename(it["meta"], output_dir) for it in items]
+    export_separate_excel(all_records, headers, output_paths)
+    for p in output_paths:
+        log(f"  → {p}")
+    return output_paths
+
+
+def process_images_batch(
+    image_paths: list,
+    output_dir: str,
+    log_callback=None,
+    handwriting: bool = False,
+    merge_output: bool = False,
+    merged_output_path: str = None,
+    progress_callback=None,
+    template_path: str = None,
+    api_config: ApiConfig = None,
+) -> list:
+    """
+    一步到位（识别即导出，无人工复核）。GUI 现在改用 extract_batch + 复核 + export_batch，
+    此入口保留给命令行/无人值守场景。全部失败时抛出异常。
+    """
+    def log(msg):
+        print(msg)
+        if log_callback:
+            log_callback(msg)
+
+    total = len(image_paths)
+    log(f"[批量处理] 共 {total} 个文件，模式={'合并输出' if merge_output else '分别输出'}")
+
+    extraction = extract_batch(
+        image_paths,
+        log_callback=log_callback,
+        handwriting=handwriting,
+        progress_callback=progress_callback,
+        template_path=template_path,
+        api_config=api_config,
+    )
+
+    if not extraction["items"]:
+        raise RuntimeError(f"全部 {total} 个文件提取失败，未生成任何文件（详见日志）")
+
+    result_paths = export_batch(
+        extraction,
+        output_dir,
+        merge_output=merge_output,
+        merged_output_path=merged_output_path,
+        log_callback=log_callback,
+    )
+
+    ok = len(extraction["items"])
+    failed = extraction["failed"]
     if failed:
         log(f"\n⚠ 完成 {ok}/{total}，{len(failed)} 个失败：")
         for fname, err in failed:

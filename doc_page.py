@@ -12,6 +12,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -27,8 +28,10 @@ from PySide6.QtWidgets import (
 )
 
 from config import IMG_EXTS, ALL_EXTS
+from ocr_to_excel import export_batch
+from review_dialog import ReviewDialog
 from widgets import FileDropListWidget
-from workers import BatchWorker
+from workers import ExtractWorker
 
 
 class DocPageMixin:
@@ -341,23 +344,23 @@ class DocPageMixin:
             QMessageBox.critical(self, "模板错误", str(e))
             return
 
-        output_dir = os.path.dirname(os.path.abspath(self.selected_files[0]))
-        self._worker = BatchWorker(
+        # 导出参数先存起来，等用户在复核窗口确认后再用
+        self._pending_output_dir = os.path.dirname(os.path.abspath(self.selected_files[0]))
+        self._pending_merge = self.merge_check.isChecked()
+        self._worker = ExtractWorker(
             image_paths=self.selected_files,
-            output_dir=output_dir,
             handwriting=self.handwriting_check.isChecked(),
-            merge_output=self.merge_check.isChecked(),
             template_path=tpl_path,
             api_config=api_config,
         )
         self._worker.progress_update.connect(self._on_worker_progress)
         self._worker.log_message.connect(self._append_log)
-        self._worker.task_finished.connect(self._on_worker_finished)
+        self._worker.extract_finished.connect(self._on_extract_finished)
         self._worker.task_failed.connect(self._on_worker_failed)
         self._set_processing(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText("初始化中...")
-        self._append_log(f"[任务] 开始处理，模板={tpl_name}")
+        self._append_log(f"[任务] 开始识别，模板={tpl_name}")
         self._worker.start()
 
     def _set_processing(self, processing: bool):
@@ -377,17 +380,49 @@ class DocPageMixin:
         self.progress_bar.setValue(max(0, min(100, pct)))
         self.progress_label.setText(f"正在处理第 {current}/{total} 个文件...")
 
-    def _on_worker_finished(self, paths):
+    def _on_extract_finished(self, extraction):
+        self._worker = None
+        self.progress_bar.setValue(100)
+        items = extraction.get("items", [])
+        failed = extraction.get("failed", [])
+        self._append_log(f"[识别完成] 成功 {len(items)} 个，失败 {len(failed)} 个")
+        if not items:
+            self._set_processing(False)
+            self.progress_label.setText("识别失败")
+            QMessageBox.warning(self, "无可复核数据", "没有识别到任何记录，无法导出。")
+            return
+        self.progress_label.setText("请在复核窗口核对数据")
+        dlg = ReviewDialog(extraction, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            edited = dlg.get_edited_extraction()
+            self._do_export(edited)
+        else:
+            self._set_processing(False)
+            self.progress_label.setText("已取消导出")
+            self._append_log("[复核] 用户取消，未导出")
+
+    def _do_export(self, extraction):
+        try:
+            paths = export_batch(
+                extraction,
+                self._pending_output_dir,
+                merge_output=self._pending_merge,
+                log_callback=self._append_log,
+            )
+        except Exception as e:
+            self._set_processing(False)
+            self.progress_label.setText("导出失败")
+            self._append_log(f"[导出失败] {e}")
+            QMessageBox.critical(self, "导出失败", str(e))
+            return
         self._set_processing(False)
         self.output_excel_paths = list(paths)
-        self.progress_bar.setValue(100)
-        self.progress_label.setText("处理完成")
+        self.progress_label.setText("导出完成")
         self._append_log(f"[完成] 生成 {len(self.output_excel_paths)} 个输出文件")
         names = "\n".join([os.path.basename(p) for p in self.output_excel_paths[:8]])
         if len(self.output_excel_paths) > 8:
             names += f"\n... 共 {len(self.output_excel_paths)} 个"
-        QMessageBox.information(self, "处理完成", f"识别任务已完成。\n\n输出文件：\n{names}")
-        self._worker = None
+        QMessageBox.information(self, "导出完成", f"已导出。\n\n输出文件：\n{names}")
 
     def _on_worker_failed(self, msg: str):
         self._set_processing(False)
