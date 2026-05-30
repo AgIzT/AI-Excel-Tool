@@ -22,11 +22,11 @@ class TemplateManager:
     自定义模板：持久化存储在 base_dir/user_templates.json，程序重启后仍保留。
     """
 
-    # ── 内置模板注册表（显示名称 → 相对于 base_dir 的文件名）──────
-    # 新增内置模板时，只需在此处添加一行即可
+    # ── 内置模板注册表（显示名称 → 相对于 base_dir 的相对路径）──────
+    # 内置模板文件统一放在 templates/ 子目录；新增时在此加一行即可
     BUILTIN_TEMPLATES: dict = {
-        "进货单商品导入模板": "进货单商品导入模板.xls",
-        "多规格商品模板":     "多规格商品模板.xls",
+        "进货单商品导入模板": os.path.join("templates", "进货单商品导入模板.xls"),
+        "多规格商品模板":     os.path.join("templates", "多规格商品模板.xls"),
     }
 
     _CONFIG_FILE = "user_templates.json"

@@ -30,7 +30,7 @@ def _default_api_config() -> ApiConfig:
     """设置页未传入时的兜底接口配置（默认走智谱 GLM）。"""
     return ApiConfig(base_url=GLM_BASE_URL, model=EXTRACT_MODEL)
 
-TEMPLATE_PATH = os.path.join(BASE_DIR, "进货单商品导入模板.xls")
+TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "进货单商品导入模板.xls")
 
 
 class ExtractionError(RuntimeError):
