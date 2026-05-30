@@ -11,3 +11,6 @@ env/
 build/
 dist/
 *.spec
+
+# 运行时生成的本地配置（含本机绝对路径，勿提交）
+user_templates.json

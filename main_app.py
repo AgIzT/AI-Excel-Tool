@@ -36,6 +36,7 @@ for _p in filter(None, [_meipass, BASE_DIR]):
 from ai_chat_service import GLMChatAssistant
 from ocr_to_excel import process_images_batch
 from template_manager import TemplateManager
+from config import IMG_EXTS, EXCEL_EXTS, ALL_EXTS, CHAT_MODEL
 
 CLR_BG = "#0f1117"
 CLR_CARD = "#1a1d27"
@@ -49,10 +50,6 @@ CLR_ERROR = "#ef4444"
 CLR_TEXT = "#e2e8f0"
 CLR_TEXT_DIM = "#64748b"
 
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
-EXCEL_EXTS = {".xlsx", ".xls", ".csv"}
-ALL_EXTS = IMG_EXTS | EXCEL_EXTS
-
 
 class BatchWorker(QThread):
     progress_update = Signal(int, int)
@@ -60,7 +57,7 @@ class BatchWorker(QThread):
     task_finished = Signal(list)
     task_failed = Signal(str)
 
-    def __init__(self, image_paths, output_dir, handwriting, merge_output, template_path, glm_api_key, deepseek_api_key):
+    def __init__(self, image_paths, output_dir, handwriting, merge_output, template_path, glm_api_key):
         super().__init__()
         self._image_paths = list(image_paths)
         self._output_dir = output_dir
@@ -68,7 +65,6 @@ class BatchWorker(QThread):
         self._merge_output = bool(merge_output)
         self._template_path = template_path
         self._glm_api_key = (glm_api_key or "").strip()
-        self._deepseek_api_key = (deepseek_api_key or "").strip()
 
     def run(self):
         try:
@@ -87,8 +83,7 @@ class BatchWorker(QThread):
                 merged_output_path=None,
                 progress_callback=progress_cb,
                 template_path=self._template_path,
-                zhipu_api_key=self._glm_api_key,
-                deepseek_api_key=self._deepseek_api_key,
+                glm_api_key=self._glm_api_key,
             )
             self.task_finished.emit(result)
         except Exception as e:
@@ -619,15 +614,6 @@ class MainWindow(QMainWindow):
         self.glm_key_edit.setPlaceholderText("请输入 GLM API Key")
         form_layout.addWidget(self.glm_key_edit, 0)
 
-        deepseek_label = QLabel("DeepSeek API Key", form)
-        deepseek_label.setObjectName("dimLabel")
-        form_layout.addWidget(deepseek_label, 0)
-        self.deepseek_key_edit = QLineEdit(form)
-        self.deepseek_key_edit.setObjectName("keyLineEdit")
-        self.deepseek_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.deepseek_key_edit.setPlaceholderText("请输入 DeepSeek API Key")
-        form_layout.addWidget(self.deepseek_key_edit, 0)
-
         save_btn = QPushButton("保存配置", form)
         save_btn.setObjectName("accentButton")
         save_btn.clicked.connect(self._on_save_api_settings)
@@ -643,45 +629,35 @@ class MainWindow(QMainWindow):
         self._load_api_settings_to_inputs()
         return page
 
-    def _get_saved_api_keys(self):
-        glm_key = str(self.settings.value("api/glm_key", "", str) or "").strip()
-        deepseek_key = str(self.settings.value("api/deepseek_key", "", str) or "").strip()
-        return glm_key, deepseek_key
+    def _get_saved_glm_key(self):
+        return str(self.settings.value("api/glm_key", "", str) or "").strip()
 
     def _load_api_settings_to_inputs(self):
-        if not hasattr(self, "glm_key_edit") or not hasattr(self, "deepseek_key_edit"):
+        if not hasattr(self, "glm_key_edit"):
             return
-        glm_key, deepseek_key = self._get_saved_api_keys()
-        self.glm_key_edit.setText(glm_key)
-        self.deepseek_key_edit.setText(deepseek_key)
+        self.glm_key_edit.setText(self._get_saved_glm_key())
 
-    def _persist_api_keys(self, glm_key: str, deepseek_key: str):
+    def _persist_glm_key(self, glm_key: str):
         self.settings.setValue("api/glm_key", (glm_key or "").strip())
-        self.settings.setValue("api/deepseek_key", (deepseek_key or "").strip())
         self.settings.sync()
 
-    def _require_api_keys(self, need_deepseek: bool):
-        glm_key, deepseek_key = self._get_saved_api_keys()
+    def _require_glm_key(self):
+        glm_key = self._get_saved_glm_key()
         if not glm_key:
             self._append_log("[配置缺失] 请先在设置页配置 GLM API Key")
             QMessageBox.warning(self, "缺少凭证", "请先到【设置】页面填写并保存 GLM API Key。")
-            return None, None
-        if need_deepseek and not deepseek_key:
-            self._append_log("[配置缺失] 请先在设置页配置 DeepSeek API Key")
-            QMessageBox.warning(self, "缺少凭证", "请先到【设置】页面填写并保存 DeepSeek API Key。")
-            return None, None
-        return glm_key, deepseek_key
+            return None
+        return glm_key
 
     def _on_save_api_settings(self):
-        if not hasattr(self, "glm_key_edit") or not hasattr(self, "deepseek_key_edit"):
+        if not hasattr(self, "glm_key_edit"):
             return
         glm_key = self.glm_key_edit.text().strip()
-        deepseek_key = self.deepseek_key_edit.text().strip()
-        self._persist_api_keys(glm_key, deepseek_key)
+        self._persist_glm_key(glm_key)
         self.chat_assistant = None
         self._chat_api_key = ""
-        self._append_log("[设置] API 凭证已保存")
-        QMessageBox.information(self, "保存成功", "API 凭证已保存。")
+        self._append_log("[设置] GLM API Key 已保存")
+        QMessageBox.information(self, "保存成功", "GLM API Key 已保存。")
 
     def _load_templates(self):
         names = self.template_manager.get_template_names()
@@ -847,8 +823,8 @@ class MainWindow(QMainWindow):
         if not self.selected_files:
             QMessageBox.warning(self, "未选择文件", "请先选择至少一个单据文件。")
             return
-        glm_key, deepseek_key = self._require_api_keys(need_deepseek=True)
-        if not glm_key or not deepseek_key:
+        glm_key = self._require_glm_key()
+        if not glm_key:
             return
         tpl_name = self.template_combo.currentText().strip()
         if not tpl_name:
@@ -868,7 +844,6 @@ class MainWindow(QMainWindow):
             merge_output=self.merge_check.isChecked(),
             template_path=tpl_path,
             glm_api_key=glm_key,
-            deepseek_api_key=deepseek_key,
         )
         self._worker.progress_update.connect(self._on_worker_progress)
         self._worker.log_message.connect(self._append_log)
@@ -938,7 +913,7 @@ class MainWindow(QMainWindow):
         if self.chat_assistant is None or self._chat_api_key != api_key:
             self.chat_assistant = GLMChatAssistant(
                 api_key=api_key,
-                model="glm-5",
+                model=CHAT_MODEL,
                 system_prompt="你是本软件的AI对话助手。请使用中文，回答准确、简洁、可执行。",
             )
             self._chat_api_key = api_key
@@ -1009,7 +984,7 @@ class MainWindow(QMainWindow):
         text = self.chat_input.toPlainText().strip()
         if not text:
             return
-        glm_key, _ = self._require_api_keys(need_deepseek=False)
+        glm_key = self._require_glm_key()
         if not glm_key:
             return
         self.chat_input.clear()
@@ -1063,7 +1038,7 @@ class MainWindow(QMainWindow):
     def _on_reset_chat(self):
         if self._ai_busy:
             return
-        glm_key, _ = self._require_api_keys(need_deepseek=False)
+        glm_key = self._require_glm_key()
         if not glm_key:
             self._reset_chat_ui()
             return
