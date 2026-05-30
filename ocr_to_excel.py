@@ -14,6 +14,7 @@ import pandas as pd
 
 from config import (
     BASE_DIR,
+    ApiConfig,
     GLM_BASE_URL,
     GLM_ENV_NAMES,
     EXTRACT_MODEL,
@@ -23,6 +24,11 @@ from config import (
     IMG_EXTS,
     TEMPLATE_HEADER_ROW,
 )
+
+
+def _default_api_config() -> ApiConfig:
+    """设置页未传入时的兜底接口配置（默认走智谱 GLM）。"""
+    return ApiConfig(base_url=GLM_BASE_URL, model=EXTRACT_MODEL)
 
 TEMPLATE_PATH = os.path.join(BASE_DIR, "进货单商品导入模板.xls")
 
@@ -78,10 +84,11 @@ def _resolve_runtime_key(explicit_key: str = "", env_names: tuple = (), display_
     raise RuntimeError(f"未配置 {display_name}，请先在设置页填写并保存")
 
 
-def _build_glm_client(glm_api_key: str = ""):
+def _build_client(api_config: ApiConfig):
     from openai import OpenAI
-    key = _resolve_runtime_key(glm_api_key, GLM_ENV_NAMES, "GLM API Key")
-    return OpenAI(api_key=key, base_url=GLM_BASE_URL)
+    key = _resolve_runtime_key(api_config.api_key, GLM_ENV_NAMES, "API Key")
+    base_url = (api_config.base_url or GLM_BASE_URL).strip()
+    return OpenAI(api_key=key, base_url=base_url)
 
 
 # ─────────────────────────────────────────────
@@ -214,18 +221,20 @@ def extract_records(
     file_path: str,
     headers: list,
     handwriting: bool = False,
-    glm_api_key: str = "",
+    api_config: ApiConfig = None,
     log=print,
 ) -> tuple:
     """
-    单一入口：图片走视觉识别，表格走文本对齐，统一调用同一个 GLM 模型，
+    单一入口：图片走视觉识别，表格走文本对齐，统一调用所配置的多模态模型，
     一步返回 (records, meta)。
     """
+    api_config = api_config or _default_api_config()
+    model = (api_config.model or EXTRACT_MODEL).strip()
     ext = os.path.splitext(file_path)[-1].lower()
     headers_str = json.dumps(headers, ensure_ascii=False)
 
     if ext in IMG_EXTS:
-        log(f"  → 调用 {EXTRACT_MODEL} 识别图片（手写体：{'开' if handwriting else '关'}）")
+        log(f"  → 调用 {model} 识别图片（手写体：{'开' if handwriting else '关'}）")
         data_url = image_to_data_url(file_path)
         user_content = [
             {
@@ -239,7 +248,7 @@ def extract_records(
             {"type": "image_url", "image_url": {"url": data_url}},
         ]
     else:
-        log(f"  → 读取表格并调用 {EXTRACT_MODEL} 对齐字段")
+        log(f"  → 读取表格并调用 {model} 对齐字段")
         text = read_excel_as_text(file_path)
         user_content = (
             f"模板表头字段：{headers_str}\n\n"
@@ -247,10 +256,10 @@ def extract_records(
             "请提取供应商名称、单据日期及所有商品数据，按系统指定的 JSON 格式输出。"
         )
 
-    client = _build_glm_client(glm_api_key)
+    client = _build_client(api_config)
     system_prompt = _load_extract_system_prompt(handwriting)
     response = client.chat.completions.create(
-        model=EXTRACT_MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -301,7 +310,7 @@ def process_image(
     log_callback=None,
     handwriting: bool = False,
     template_path: str = None,
-    glm_api_key: str = "",
+    api_config: ApiConfig = None,
 ) -> str:
     """处理单个文件（图片或表格），返回输出 Excel 路径。"""
     def log(msg):
@@ -318,7 +327,7 @@ def process_image(
     log(f"  → 共 {len(headers)} 个字段")
 
     log("[步骤 2/3] AI 提取...")
-    records, meta = extract_records(image_path, headers, handwriting=handwriting, glm_api_key=glm_api_key, log=log)
+    records, meta = extract_records(image_path, headers, handwriting=handwriting, api_config=api_config, log=log)
     if not records:
         raise ExtractionError("未提取到任何商品记录")
 
@@ -339,7 +348,7 @@ def process_images_batch(
     merged_output_path: str = None,
     progress_callback=None,
     template_path: str = None,
-    glm_api_key: str = "",
+    api_config: ApiConfig = None,
 ) -> list:
     """
     批量处理多个图片/表格。单个文件提取失败会被跳过并记录，不会写出误导性的空文件；
@@ -372,7 +381,7 @@ def process_images_batch(
 
         try:
             records, meta = extract_records(
-                image_path, headers, handwriting=handwriting, glm_api_key=glm_api_key, log=log
+                image_path, headers, handwriting=handwriting, api_config=api_config, log=log
             )
             if not records:
                 raise ExtractionError("未提取到任何商品记录")

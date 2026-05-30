@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
-    QScrollArea,
     QSizePolicy,
     QSpacerItem,
     QStackedWidget,
@@ -33,10 +32,9 @@ for _p in filter(None, [_meipass, BASE_DIR]):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ai_chat_service import GLMChatAssistant
 from ocr_to_excel import process_images_batch
 from template_manager import TemplateManager
-from config import IMG_EXTS, EXCEL_EXTS, ALL_EXTS, CHAT_MODEL
+from config import IMG_EXTS, ALL_EXTS, PROVIDER_PRESETS, DEFAULT_PROVIDER, ApiConfig
 
 CLR_BG = "#0f1117"
 CLR_CARD = "#1a1d27"
@@ -57,14 +55,14 @@ class BatchWorker(QThread):
     task_finished = Signal(list)
     task_failed = Signal(str)
 
-    def __init__(self, image_paths, output_dir, handwriting, merge_output, template_path, glm_api_key):
+    def __init__(self, image_paths, output_dir, handwriting, merge_output, template_path, api_config):
         super().__init__()
         self._image_paths = list(image_paths)
         self._output_dir = output_dir
         self._handwriting = bool(handwriting)
         self._merge_output = bool(merge_output)
         self._template_path = template_path
-        self._glm_api_key = (glm_api_key or "").strip()
+        self._api_config = api_config
 
     def run(self):
         try:
@@ -83,27 +81,9 @@ class BatchWorker(QThread):
                 merged_output_path=None,
                 progress_callback=progress_cb,
                 template_path=self._template_path,
-                glm_api_key=self._glm_api_key,
+                api_config=self._api_config,
             )
             self.task_finished.emit(result)
-        except Exception as e:
-            self.task_failed.emit(str(e))
-
-
-class AIChatWorker(QThread):
-    response_ready = Signal(str)
-    task_failed = Signal(str)
-
-    def __init__(self, send_func, user_message, api_key):
-        super().__init__()
-        self._send_func = send_func
-        self._user_message = user_message
-        self._api_key = api_key
-
-    def run(self):
-        try:
-            answer = self._send_func(self._user_message, self._api_key)
-            self.response_ready.emit(answer)
         except Exception as e:
             self.task_failed.emit(str(e))
 
@@ -156,43 +136,6 @@ class FileDropListWidget(QListWidget):
         return paths
 
 
-class ChatInputTextEdit(QTextEdit):
-    send_requested = Signal()
-
-    def keyPressEvent(self, event):
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                super().keyPressEvent(event)
-                return
-            self.send_requested.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
-class ChatBubbleWidget(QFrame):
-    def __init__(self, role: str, text: str, loading: bool = False, parent=None):
-        super().__init__(parent)
-        self.role = role
-        self.loading = loading
-        self.setObjectName("chatBubbleUser" if role == "user" else "chatBubbleAI")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(4)
-        self.label = QLabel(text, self)
-        self.label.setObjectName("chatBubbleText")
-        self.label.setWordWrap(True)
-        self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self.label.setMaximumWidth(720)
-        layout.addWidget(self.label, 0)
-        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        self.setMaximumWidth(760)
-
-    def set_message(self, text: str):
-        self.label.setText(text)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -201,21 +144,16 @@ class MainWindow(QMainWindow):
         self.selected_files = []
         self._selected_file_set = set()
         self.output_excel_paths = []
-        self.chat_assistant = None
-        self._chat_api_key = ""
         self._active_route = ""
         self._pages = {}
         self._route_indexes = {}
         self._nav_buttons = {}
         self._worker = None
-        self._ai_worker = None
         self._processing = False
-        self._ai_busy = False
         self._log_buffer = []
         self._log_collapsed = True
         self._preview_path = ""
         self._preview_source = QPixmap()
-        self._pending_ai_bubble = None
 
         self._log_flush_timer = QTimer(self)
         self._log_flush_timer.setSingleShot(True)
@@ -229,7 +167,6 @@ class MainWindow(QMainWindow):
 
         self._route_builders = {
             "单据处理": self._build_doc_page,
-            "AI助手": self._build_ai_page,
             "设置": self._build_setting_page,
         }
 
@@ -334,7 +271,7 @@ class MainWindow(QMainWindow):
         brand_layout.addWidget(subtitle, 0)
         layout.addWidget(brand, 0)
 
-        for route in ["单据处理", "AI助手", "设置"]:
+        for route in ["单据处理", "设置"]:
             btn = QPushButton(route, self.sidebar)
             btn.setObjectName("navButton")
             btn.setProperty("active", False)
@@ -508,83 +445,6 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(options, 0)
         return page
 
-    def _build_ai_page(self):
-        page = QWidget(self.page_stack)
-        layout = QHBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        left = QFrame(page)
-        left.setObjectName("card")
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(16, 14, 16, 14)
-        left_layout.setSpacing(10)
-        layout.addWidget(left, 8)
-
-        top_row = QWidget(left)
-        top_row_layout = QHBoxLayout(top_row)
-        top_row_layout.setContentsMargins(0, 0, 0, 0)
-        top_row_layout.setSpacing(8)
-        title = QLabel("AI 对话助手", top_row)
-        title.setObjectName("sectionTitle")
-        top_row_layout.addWidget(title, 1)
-        self.chat_reset_btn = QPushButton("清空对话", top_row)
-        self.chat_reset_btn.setObjectName("secondaryButton")
-        self.chat_reset_btn.clicked.connect(self._on_reset_chat)
-        self.chat_reset_btn.setFixedHeight(32)
-        top_row_layout.addWidget(self.chat_reset_btn, 0)
-        left_layout.addWidget(top_row, 0)
-
-        self.chat_scroll = QScrollArea(left)
-        self.chat_scroll.setObjectName("chatScroll")
-        self.chat_scroll.setWidgetResizable(True)
-        self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.chat_stream_widget = QWidget(self.chat_scroll)
-        self.chat_stream_layout = QVBoxLayout(self.chat_stream_widget)
-        self.chat_stream_layout.setContentsMargins(12, 12, 12, 12)
-        self.chat_stream_layout.setSpacing(10)
-        self.chat_stream_layout.addStretch(1)
-        self.chat_scroll.setWidget(self.chat_stream_widget)
-        left_layout.addWidget(self.chat_scroll, 1)
-
-        input_wrap = QFrame(left)
-        input_wrap.setObjectName("subCard")
-        input_layout = QHBoxLayout(input_wrap)
-        input_layout.setContentsMargins(10, 10, 10, 10)
-        input_layout.setSpacing(8)
-        self.chat_input = ChatInputTextEdit(input_wrap)
-        self.chat_input.setObjectName("chatInput")
-        self.chat_input.setPlaceholderText("输入问题，Enter 发送，Shift+Enter 换行")
-        self.chat_input.setMinimumHeight(78)
-        self.chat_input.setMaximumHeight(140)
-        self.chat_input.send_requested.connect(self._on_send_chat)
-        input_layout.addWidget(self.chat_input, 1)
-        self.chat_send_btn = QPushButton("发送", input_wrap)
-        self.chat_send_btn.setObjectName("accentButton")
-        self.chat_send_btn.setFixedWidth(92)
-        self.chat_send_btn.clicked.connect(self._on_send_chat)
-        input_layout.addWidget(self.chat_send_btn, 0, Qt.AlignmentFlag.AlignBottom)
-        left_layout.addWidget(input_wrap, 0)
-
-        right = QFrame(page)
-        right.setObjectName("card")
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(16, 14, 16, 14)
-        right_layout.setSpacing(8)
-        layout.addWidget(right, 4)
-        tips_title = QLabel("快捷提示", right)
-        tips_title.setObjectName("sectionTitle")
-        right_layout.addWidget(tips_title, 0)
-        for tip in ["总结最新日志", "解释识别失败原因", "如何提升OCR效果", "生成排障清单"]:
-            btn = QPushButton(f"⚡ {tip}", right)
-            btn.setObjectName("secondaryButton")
-            btn.clicked.connect(lambda _=False, t=tip: self._insert_prompt(t))
-            right_layout.addWidget(btn, 0)
-        right_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
-
-        self._reset_chat_ui()
-        return page
-
     def _build_setting_page(self):
         page = QWidget(self.page_stack)
         layout = QVBoxLayout(page)
@@ -605,22 +465,48 @@ class MainWindow(QMainWindow):
         form_layout.setContentsMargins(14, 12, 14, 12)
         form_layout.setSpacing(10)
 
-        glm_label = QLabel("GLM API Key", form)
-        glm_label.setObjectName("dimLabel")
-        form_layout.addWidget(glm_label, 0)
-        self.glm_key_edit = QLineEdit(form)
-        self.glm_key_edit.setObjectName("keyLineEdit")
-        self.glm_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.glm_key_edit.setPlaceholderText("请输入 GLM API Key")
-        form_layout.addWidget(self.glm_key_edit, 0)
+        provider_label = QLabel("接口预设", form)
+        provider_label.setObjectName("dimLabel")
+        form_layout.addWidget(provider_label, 0)
+        self.provider_combo = QComboBox(form)
+        self.provider_combo.setObjectName("comboBox")
+        self.provider_combo.addItems(list(PROVIDER_PRESETS.keys()))
+        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
+        form_layout.addWidget(self.provider_combo, 0)
+
+        base_url_label = QLabel("接口地址 (base_url)", form)
+        base_url_label.setObjectName("dimLabel")
+        form_layout.addWidget(base_url_label, 0)
+        self.base_url_edit = QLineEdit(form)
+        self.base_url_edit.setObjectName("keyLineEdit")
+        self.base_url_edit.setPlaceholderText("如 https://open.bigmodel.cn/api/paas/v4/")
+        form_layout.addWidget(self.base_url_edit, 0)
+
+        model_label = QLabel("模型名称", form)
+        model_label.setObjectName("dimLabel")
+        form_layout.addWidget(model_label, 0)
+        self.model_edit = QLineEdit(form)
+        self.model_edit.setObjectName("keyLineEdit")
+        self.model_edit.setPlaceholderText("多模态/视觉模型，如 glm-4.6v、gpt-4o、qwen-vl-max")
+        form_layout.addWidget(self.model_edit, 0)
+
+        key_label = QLabel("API Key", form)
+        key_label.setObjectName("dimLabel")
+        form_layout.addWidget(key_label, 0)
+        self.api_key_edit = QLineEdit(form)
+        self.api_key_edit.setObjectName("keyLineEdit")
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_edit.setPlaceholderText("请输入对应平台的 API Key")
+        form_layout.addWidget(self.api_key_edit, 0)
 
         save_btn = QPushButton("保存配置", form)
         save_btn.setObjectName("accentButton")
         save_btn.clicked.connect(self._on_save_api_settings)
         form_layout.addWidget(save_btn, 0)
 
-        tip = QLabel("提示：保存后将用于单据处理与AI助手请求。", form)
+        tip = QLabel("提示：任何 OpenAI 兼容的多模态模型均可。切换预设会自动填入地址与模型，仍可手动修改。", form)
         tip.setObjectName("dimLabel")
+        tip.setWordWrap(True)
         form_layout.addWidget(tip, 0)
 
         card_layout.addWidget(form, 0)
@@ -629,35 +515,72 @@ class MainWindow(QMainWindow):
         self._load_api_settings_to_inputs()
         return page
 
-    def _get_saved_glm_key(self):
-        return str(self.settings.value("api/glm_key", "", str) or "").strip()
+    def _get_saved_api_config(self) -> ApiConfig:
+        base_url = str(self.settings.value("api/base_url", "", str) or "").strip()
+        model = str(self.settings.value("api/model", "", str) or "").strip()
+        api_key = str(self.settings.value("api/api_key", "", str) or "").strip()
+        return ApiConfig(base_url=base_url, model=model, api_key=api_key)
 
     def _load_api_settings_to_inputs(self):
-        if not hasattr(self, "glm_key_edit"):
+        if not hasattr(self, "provider_combo"):
             return
-        self.glm_key_edit.setText(self._get_saved_glm_key())
+        provider = str(self.settings.value("api/provider", DEFAULT_PROVIDER, str) or DEFAULT_PROVIDER)
+        if provider not in PROVIDER_PRESETS:
+            provider = DEFAULT_PROVIDER
+        preset = PROVIDER_PRESETS.get(provider, {})
+        cfg = self._get_saved_api_config()
+        # 首次使用（无保存值）时用预设默认回填
+        base_url = cfg.base_url or preset.get("base_url", "")
+        model = cfg.model or preset.get("model", "")
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.setCurrentText(provider)
+        self.provider_combo.blockSignals(False)
+        self.base_url_edit.setText(base_url)
+        self.model_edit.setText(model)
+        self.api_key_edit.setText(cfg.api_key)
 
-    def _persist_glm_key(self, glm_key: str):
-        self.settings.setValue("api/glm_key", (glm_key or "").strip())
+    def _on_provider_changed(self, name: str):
+        if not hasattr(self, "base_url_edit"):
+            return
+        preset = PROVIDER_PRESETS.get(name)
+        if preset is None:
+            return
+        self.base_url_edit.setText(preset.get("base_url", ""))
+        self.model_edit.setText(preset.get("model", ""))
+
+    def _persist_api_settings(self, provider: str, base_url: str, model: str, api_key: str):
+        self.settings.setValue("api/provider", provider)
+        self.settings.setValue("api/base_url", (base_url or "").strip())
+        self.settings.setValue("api/model", (model or "").strip())
+        self.settings.setValue("api/api_key", (api_key or "").strip())
         self.settings.sync()
 
-    def _require_glm_key(self):
-        glm_key = self._get_saved_glm_key()
-        if not glm_key:
-            self._append_log("[配置缺失] 请先在设置页配置 GLM API Key")
-            QMessageBox.warning(self, "缺少凭证", "请先到【设置】页面填写并保存 GLM API Key。")
+    def _require_api_config(self):
+        cfg = self._get_saved_api_config()
+        missing = []
+        if not cfg.base_url:
+            missing.append("接口地址")
+        if not cfg.model:
+            missing.append("模型名称")
+        if not cfg.api_key:
+            missing.append("API Key")
+        if missing:
+            fields = "、".join(missing)
+            self._append_log(f"[配置缺失] 请先在设置页填写：{fields}")
+            QMessageBox.warning(self, "缺少配置", f"请先到【设置】页面填写并保存：{fields}。")
             return None
-        return glm_key
+        return cfg
 
     def _on_save_api_settings(self):
-        if not hasattr(self, "glm_key_edit"):
+        if not hasattr(self, "api_key_edit"):
             return
-        glm_key = self.glm_key_edit.text().strip()
-        self._persist_glm_key(glm_key)
-        self.chat_assistant = None
-        self._chat_api_key = ""
-        self._append_log("[设置] GLM API Key 已保存")
-        QMessageBox.information(self, "保存成功", "GLM API Key 已保存。")
+        provider = self.provider_combo.currentText().strip()
+        base_url = self.base_url_edit.text().strip()
+        model = self.model_edit.text().strip()
+        api_key = self.api_key_edit.text().strip()
+        self._persist_api_settings(provider, base_url, model, api_key)
+        self._append_log(f"[设置] 接口配置已保存（{provider} | {model or '未填模型'}）")
+        QMessageBox.information(self, "保存成功", "接口配置已保存。")
 
     def _load_templates(self):
         names = self.template_manager.get_template_names()
@@ -823,8 +746,8 @@ class MainWindow(QMainWindow):
         if not self.selected_files:
             QMessageBox.warning(self, "未选择文件", "请先选择至少一个单据文件。")
             return
-        glm_key = self._require_glm_key()
-        if not glm_key:
+        api_config = self._require_api_config()
+        if api_config is None:
             return
         tpl_name = self.template_combo.currentText().strip()
         if not tpl_name:
@@ -843,7 +766,7 @@ class MainWindow(QMainWindow):
             handwriting=self.handwriting_check.isChecked(),
             merge_output=self.merge_check.isChecked(),
             template_path=tpl_path,
-            glm_api_key=glm_key,
+            api_config=api_config,
         )
         self._worker.progress_update.connect(self._on_worker_progress)
         self._worker.log_message.connect(self._append_log)
@@ -864,8 +787,7 @@ class MainWindow(QMainWindow):
         self.template_combo.setEnabled(not processing)
         self.handwriting_check.setEnabled(not processing)
         self.merge_check.setEnabled(not processing)
-        if not self._ai_busy:
-            self.sidebar_status.setText("状态：处理中" if processing else f"状态：{self._active_route}")
+        self.sidebar_status.setText("状态：处理中" if processing else f"状态：{self._active_route}")
 
     def _on_worker_progress(self, current: int, total: int):
         total = max(1, total)
@@ -907,147 +829,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "已打开目录", "已为你打开输出目录。")
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
-
-    def _get_chat_assistant(self, api_key: str):
-        api_key = (api_key or "").strip()
-        if self.chat_assistant is None or self._chat_api_key != api_key:
-            self.chat_assistant = GLMChatAssistant(
-                api_key=api_key,
-                model=CHAT_MODEL,
-                system_prompt="你是本软件的AI对话助手。请使用中文，回答准确、简洁、可执行。",
-            )
-            self._chat_api_key = api_key
-        return self.chat_assistant
-
-    def send_ai_message(self, user_message: str, api_key: str) -> str:
-        assistant = self._get_chat_assistant(api_key)
-        return assistant.send_message(user_message)
-
-    def send_ai_message_async(self, user_message: str, api_key: str, on_success=None, on_error=None):
-        if self._ai_worker is not None and self._ai_worker.isRunning():
-            raise RuntimeError("AI助手正在处理上一条消息")
-        self._ai_worker = AIChatWorker(self.send_ai_message, user_message, api_key)
-        if on_success:
-            self._ai_worker.response_ready.connect(on_success)
-        if on_error:
-            self._ai_worker.task_failed.connect(on_error)
-        self._ai_worker.finished.connect(self._on_ai_worker_finished)
-        self._ai_worker.start()
-
-    def reset_ai_conversation(self, api_key: str):
-        assistant = self._get_chat_assistant(api_key)
-        assistant.reset()
-
-    def _insert_prompt(self, text: str):
-        if not hasattr(self, "chat_input"):
-            return
-        if self._ai_busy:
-            return
-        current = self.chat_input.toPlainText().strip()
-        self.chat_input.setPlainText(f"{current}\n{text}".strip())
-        self.chat_input.moveCursor(QTextCursor.MoveOperation.End)
-        self.chat_input.setFocus()
-
-    def _append_chat_bubble(self, role: str, text: str, loading: bool = False):
-        row = QWidget(self.chat_stream_widget)
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(10)
-        bubble = ChatBubbleWidget(role, text, loading=loading, parent=row)
-        if role == "user":
-            row_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
-            row_layout.addWidget(bubble, 0, Qt.AlignmentFlag.AlignRight)
-        else:
-            row_layout.addWidget(bubble, 0, Qt.AlignmentFlag.AlignLeft)
-            row_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
-        insert_index = max(0, self.chat_stream_layout.count() - 1)
-        self.chat_stream_layout.insertWidget(insert_index, row)
-        QTimer.singleShot(0, self._scroll_chat_to_bottom)
-        return bubble
-
-    def _scroll_chat_to_bottom(self):
-        bar = self.chat_scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-    def _reset_chat_ui(self):
-        while self.chat_stream_layout.count() > 1:
-            item = self.chat_stream_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._pending_ai_bubble = None
-        self._append_chat_bubble("ai", "你好，我是 AI 对话助手。你可以问我识别流程、模板配置和异常排查。")
-
-    def _on_send_chat(self):
-        if self._ai_busy:
-            return
-        text = self.chat_input.toPlainText().strip()
-        if not text:
-            return
-        glm_key = self._require_glm_key()
-        if not glm_key:
-            return
-        self.chat_input.clear()
-        self._append_chat_bubble("user", text)
-        self._pending_ai_bubble = self._append_chat_bubble("ai", "正在思考...")
-        self._append_log(f"[AI助手][用户] {text}")
-        try:
-            self.send_ai_message_async(
-                text,
-                api_key=glm_key,
-                on_success=self._on_ai_response_success,
-                on_error=self._on_ai_response_error,
-            )
-            self._set_ai_busy(True)
-        except Exception as e:
-            self._on_ai_response_error(str(e))
-
-    def _set_ai_busy(self, busy: bool):
-        self._ai_busy = busy
-        self.chat_send_btn.setEnabled(not busy)
-        self.chat_input.setEnabled(not busy)
-        self.chat_reset_btn.setEnabled(not busy)
-        if not self._processing:
-            self.sidebar_status.setText("状态：AI思考中" if busy else f"状态：{self._active_route}")
-
-    def _on_ai_response_success(self, answer: str):
-        if self._pending_ai_bubble is not None:
-            self._pending_ai_bubble.set_message(answer)
-        else:
-            self._append_chat_bubble("ai", answer)
-        self._append_log(f"[AI助手] {answer}")
-        self._set_ai_busy(False)
-
-    def _on_ai_response_error(self, msg):
-        err = str(msg)
-        text = f"调用失败：{err}"
-        if self._pending_ai_bubble is not None:
-            self._pending_ai_bubble.set_message(text)
-        else:
-            self._append_chat_bubble("ai", text)
-        self._append_log(f"[AI助手][错误] {err}")
-        self._set_ai_busy(False)
-        QMessageBox.critical(self, "AI 调用失败", err)
-
-    def _on_ai_worker_finished(self):
-        if self._ai_busy:
-            self._set_ai_busy(False)
-        self._pending_ai_bubble = None
-        self._ai_worker = None
-
-    def _on_reset_chat(self):
-        if self._ai_busy:
-            return
-        glm_key = self._require_glm_key()
-        if not glm_key:
-            self._reset_chat_ui()
-            return
-        try:
-            self.reset_ai_conversation(glm_key)
-            self._reset_chat_ui()
-            self._append_log("[AI助手] 对话已重置")
-        except Exception as e:
-            QMessageBox.critical(self, "重置失败", str(e))
 
     def _toggle_log_drawer(self):
         self._log_collapsed = not self._log_collapsed
@@ -1147,33 +928,6 @@ class MainWindow(QMainWindow):
                 border-radius: 10px;
                 color: #a8b4c8;
                 selection-background-color: {CLR_ACCENT};
-            }}
-            #chatScroll {{
-                background-color: {CLR_CARD2};
-                border: 1px solid {CLR_BORDER};
-                border-radius: 10px;
-            }}
-            #chatInput {{
-                background-color: {CLR_CARD2};
-                border: 1px solid {CLR_BORDER};
-                border-radius: 8px;
-                color: {CLR_TEXT};
-                padding: 6px;
-            }}
-            #chatBubbleUser {{
-                background-color: {CLR_ACCENT};
-                border: none;
-                border-radius: 12px;
-            }}
-            #chatBubbleAI {{
-                background-color: #2a2f45;
-                border: none;
-                border-radius: 12px;
-            }}
-            #chatBubbleText {{
-                color: #ffffff;
-                font-size: 13px;
-                line-height: 1.35;
             }}
             #comboBox {{
                 min-height: 32px;

@@ -5,28 +5,53 @@ config.py
 """
 
 import os
+from dataclasses import dataclass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────
-# 智谱 GLM 接口（OpenAI 兼容端点，OCR 提取与对话共用一家）
+# 接口预设：base_url + 默认模型。
+# 真正生效的值来自设置页（QSettings），这里只是各家「开箱即用」的默认。
+# 任何 OpenAI 兼容的多模态（视觉）模型都能用，「自定义」一栏可手填。
 # ─────────────────────────────────────────────
-GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+PROVIDER_PRESETS = {
+    "智谱 GLM": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+        "model": "glm-4.6v",
+    },
+    "OpenAI": {
+        "base_url": "https://api.openai.com/v1/",
+        "model": "gpt-4o",
+    },
+    "通义千问": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/",
+        "model": "qwen-vl-max",
+    },
+    "自定义": {
+        "base_url": "",
+        "model": "",
+    },
+}
 
-# 单据提取所用视觉模型。
-# 备选模型 id（若默认报「模型不存在」，把下面这行换成其一即可）：
-#   glm-4.6v        —— 推荐，质量最好，输入¥1/输出¥3 每百万 token
-#   glm-4.6v-flash  —— 免费、轻量、偏弱
-#   glm-4v-flash    —— 老版兜底，确定可用
-EXTRACT_MODEL = "glm-4.6v"
+DEFAULT_PROVIDER = "智谱 GLM"
+
+# 兜底默认（设置页留空时使用）。
+# 备选 GLM 模型 id：glm-4.6v(推荐) / glm-4.6v-flash(免费偏弱) / glm-4v-flash(老版兜底)
+GLM_BASE_URL = PROVIDER_PRESETS[DEFAULT_PROVIDER]["base_url"]
+EXTRACT_MODEL = PROVIDER_PRESETS[DEFAULT_PROVIDER]["model"]
 EXTRACT_TEMPERATURE = 0.0
 EXTRACT_MAX_TOKENS = 4096
 
-# AI 对话助手模型
-CHAT_MODEL = "glm-5"
-
-# 环境变量兜底名（显式传入的 Key 优先级最高）
+# 环境变量兜底名（设置页显式填写的 Key 优先级最高）
 GLM_ENV_NAMES = ("ZHIPU_API_KEY", "GLM_API_KEY")
+
+
+@dataclass(frozen=True)
+class ApiConfig:
+    """一次识别请求所需的接口三要素，始终一起传递。"""
+    base_url: str
+    model: str
+    api_key: str = ""
 
 # ─────────────────────────────────────────────
 # 文件与模板
