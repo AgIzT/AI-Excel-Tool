@@ -2,7 +2,7 @@
 """
 doc_page.py
 「单据处理」页：文件选择/拖拽、预览、模板选择、批量识别与进度。
-以 Mixin 形式提供给 MainWindow，依赖 self 上由外壳初始化的状态与日志方法。
+以 Mixin 形式提供给 MainWindow，依赖 self 上由外壳初始化的状态、日志与 _toast 提示。
 """
 
 import os
@@ -10,21 +10,28 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
     QDialog,
     QFileDialog,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidgetItem,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
     QSizePolicy,
     QSpacerItem,
     QVBoxLayout,
     QWidget,
+)
+
+from qfluentwidgets import (
+    BodyLabel,
+    CaptionLabel,
+    CheckBox,
+    ComboBox,
+    FluentIcon,
+    PrimaryPushButton,
+    ProgressBar,
+    PushButton,
+    SimpleCardWidget,
+    SubtitleLabel,
 )
 
 from config import IMG_EXTS, ALL_EXTS
@@ -36,34 +43,30 @@ from workers import ExtractWorker
 
 class DocPageMixin:
     def _build_doc_page(self):
-        page = QWidget(self.page_stack)
+        page = QWidget()
         layout = QHBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 18)
+        layout.setSpacing(14)
 
-        left = QFrame(page)
-        left.setObjectName("card")
+        # 左：文件与执行
+        left = SimpleCardWidget(page)
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(16, 14, 16, 14)
-        left_layout.setSpacing(8)
+        left_layout.setContentsMargins(18, 16, 18, 16)
+        left_layout.setSpacing(10)
         layout.addWidget(left, 7)
 
-        left_title = QLabel("文件上传与任务执行", left)
-        left_title.setObjectName("sectionTitle")
+        left_title = SubtitleLabel("文件上传与任务执行", left)
         left_layout.addWidget(left_title, 0)
 
         file_toolbar = QWidget(left)
         file_toolbar_layout = QHBoxLayout(file_toolbar)
         file_toolbar_layout.setContentsMargins(0, 0, 0, 0)
         file_toolbar_layout.setSpacing(8)
-        self.pick_files_btn = QPushButton("📂 浏览文件", file_toolbar)
-        self.pick_files_btn.setObjectName("secondaryButton")
+        self.pick_files_btn = PushButton(FluentIcon.FOLDER_ADD, "浏览文件", file_toolbar)
         self.pick_files_btn.clicked.connect(self._on_pick_files)
-        self.clear_files_btn = QPushButton("🗑 清空列表", file_toolbar)
-        self.clear_files_btn.setObjectName("secondaryButton")
+        self.clear_files_btn = PushButton(FluentIcon.DELETE, "清空列表", file_toolbar)
         self.clear_files_btn.clicked.connect(self._on_clear_files)
-        self.remove_selected_btn = QPushButton("✕ 移除选中", file_toolbar)
-        self.remove_selected_btn.setObjectName("secondaryButton")
+        self.remove_selected_btn = PushButton(FluentIcon.REMOVE, "移除选中", file_toolbar)
         self.remove_selected_btn.clicked.connect(self._on_remove_selected_file)
         file_toolbar_layout.addWidget(self.pick_files_btn, 0)
         file_toolbar_layout.addWidget(self.clear_files_btn, 0)
@@ -71,96 +74,82 @@ class DocPageMixin:
         file_toolbar_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
         left_layout.addWidget(file_toolbar, 0)
 
-        drop_hint = QLabel("将图片/Excel 直接拖拽到下方文件列表", left)
-        drop_hint.setObjectName("dimLabel")
+        drop_hint = CaptionLabel("将图片/Excel 直接拖拽到下方文件列表", left)
         left_layout.addWidget(drop_hint, 0)
 
         self.file_list = FileDropListWidget(left)
-        self.file_list.setObjectName("fileList")
         self.file_list.files_dropped.connect(self._add_files)
         self.file_list.itemSelectionChanged.connect(self._on_file_selection_changed)
         left_layout.addWidget(self.file_list, 1)
 
-        self.file_stats_label = QLabel("尚未选择文件", left)
-        self.file_stats_label.setObjectName("dimLabel")
+        self.file_stats_label = CaptionLabel("尚未选择文件", left)
         left_layout.addWidget(self.file_stats_label, 0)
 
         action_row = QWidget(left)
         action_layout = QHBoxLayout(action_row)
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(8)
-        self.start_btn = QPushButton("🚀 开始识别", action_row)
-        self.start_btn.setObjectName("accentButton")
+        self.start_btn = PrimaryPushButton(FluentIcon.PLAY, "开始识别", action_row)
         self.start_btn.clicked.connect(self._on_start_process)
-        self.open_btn = QPushButton("📊 打开输出", action_row)
-        self.open_btn.setObjectName("successButton")
+        self.open_btn = PushButton(FluentIcon.VIEW, "打开输出", action_row)
         self.open_btn.clicked.connect(self._on_open_output)
         action_layout.addWidget(self.start_btn, 1)
         action_layout.addWidget(self.open_btn, 1)
         left_layout.addWidget(action_row, 0)
 
-        self.progress_bar = QProgressBar(left)
-        self.progress_bar.setObjectName("progressBar")
+        self.progress_bar = ProgressBar(left)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         left_layout.addWidget(self.progress_bar, 0)
 
-        self.progress_label = QLabel("", left)
-        self.progress_label.setObjectName("dimLabel")
+        self.progress_label = CaptionLabel("", left)
         left_layout.addWidget(self.progress_label, 0)
 
-        right = QFrame(page)
-        right.setObjectName("card")
+        # 右：预览与选项
+        right = SimpleCardWidget(page)
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(16, 14, 16, 14)
-        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(18, 16, 18, 16)
+        right_layout.setSpacing(10)
         layout.addWidget(right, 5)
 
-        right_title = QLabel("预览与识别选项", right)
-        right_title.setObjectName("sectionTitle")
+        right_title = SubtitleLabel("预览与识别选项", right)
         right_layout.addWidget(right_title, 0)
 
-        preview_card = QFrame(right)
-        preview_card.setObjectName("subCard")
+        preview_card = QWidget(right)
         preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(10, 10, 10, 10)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.setSpacing(6)
         self.preview_label = QLabel("请选择图片文件进行预览", preview_card)
-        self.preview_label.setObjectName("previewLabel")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumHeight(260)
-        right_layout.addWidget(preview_card, 1)
         preview_layout.addWidget(self.preview_label, 1)
+        right_layout.addWidget(preview_card, 1)
 
-        options = QFrame(right)
-        options.setObjectName("subCard")
+        options = QWidget(right)
         options_layout = QVBoxLayout(options)
-        options_layout.setContentsMargins(14, 10, 14, 10)
-        options_layout.setSpacing(8)
+        options_layout.setContentsMargins(0, 0, 0, 0)
+        options_layout.setSpacing(10)
 
         tpl_row = QWidget(options)
         tpl_row_layout = QHBoxLayout(tpl_row)
         tpl_row_layout.setContentsMargins(0, 0, 0, 0)
         tpl_row_layout.setSpacing(8)
-        tpl_label = QLabel("模板", tpl_row)
-        tpl_label.setObjectName("dimLabel")
-        self.template_combo = QComboBox(tpl_row)
-        self.template_combo.setObjectName("comboBox")
+        tpl_label = BodyLabel("模板", tpl_row)
+        self.template_combo = ComboBox(tpl_row)
         self._load_templates()
         tpl_row_layout.addWidget(tpl_label, 0)
         tpl_row_layout.addWidget(self.template_combo, 1)
         options_layout.addWidget(tpl_row, 0)
 
-        add_tpl_btn = QPushButton("＋ 添加自定义模板", options)
-        add_tpl_btn.setObjectName("secondaryButton")
+        add_tpl_btn = PushButton(FluentIcon.ADD, "添加自定义模板", options)
         add_tpl_btn.clicked.connect(self._on_add_custom_template)
         options_layout.addWidget(add_tpl_btn, 0)
 
-        self.handwriting_check = QCheckBox("手写体识别", options)
+        self.handwriting_check = CheckBox("手写体识别", options)
         self.handwriting_check.setChecked(False)
         options_layout.addWidget(self.handwriting_check, 0)
 
-        self.merge_check = QCheckBox("合并输出到一个 Excel", options)
+        self.merge_check = CheckBox("合并输出到一个 Excel", options)
         self.merge_check.setChecked(False)
         options_layout.addWidget(self.merge_check, 0)
 
@@ -195,7 +184,7 @@ class DocPageMixin:
                 self.template_combo.setCurrentIndex(idx)
             self._append_log(f"[模板] 已添加自定义模板：{name}")
         except Exception as e:
-            QMessageBox.critical(self, "添加模板失败", str(e))
+            self._toast("error", "添加模板失败", str(e))
 
     def _on_pick_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -329,19 +318,19 @@ class DocPageMixin:
         if self._processing:
             return
         if not self.selected_files:
-            QMessageBox.warning(self, "未选择文件", "请先选择至少一个单据文件。")
+            self._toast("warning", "未选择文件", "请先选择至少一个单据文件。")
             return
         api_config = self._require_api_config()
         if api_config is None:
             return
         tpl_name = self.template_combo.currentText().strip()
         if not tpl_name:
-            QMessageBox.warning(self, "模板缺失", "未检测到可用模板，请先添加模板。")
+            self._toast("warning", "模板缺失", "未检测到可用模板，请先添加模板。")
             return
         try:
             tpl_path = self.template_manager.get_template_path(tpl_name)
         except Exception as e:
-            QMessageBox.critical(self, "模板错误", str(e))
+            self._toast("error", "模板错误", str(e))
             return
 
         # 导出参数先存起来，等用户在复核窗口确认后再用
@@ -372,7 +361,6 @@ class DocPageMixin:
         self.template_combo.setEnabled(not processing)
         self.handwriting_check.setEnabled(not processing)
         self.merge_check.setEnabled(not processing)
-        self.sidebar_status.setText("状态：处理中" if processing else f"状态：{self._active_route}")
 
     def _on_worker_progress(self, current: int, total: int):
         total = max(1, total)
@@ -389,7 +377,7 @@ class DocPageMixin:
         if not items:
             self._set_processing(False)
             self.progress_label.setText("识别失败")
-            QMessageBox.warning(self, "无可复核数据", "没有识别到任何记录，无法导出。")
+            self._toast("warning", "无可复核数据", "没有识别到任何记录，无法导出。")
             return
         self.progress_label.setText("请在复核窗口核对数据")
         dlg = ReviewDialog(extraction, self)
@@ -413,27 +401,29 @@ class DocPageMixin:
             self._set_processing(False)
             self.progress_label.setText("导出失败")
             self._append_log(f"[导出失败] {e}")
-            QMessageBox.critical(self, "导出失败", str(e))
+            self._toast("error", "导出失败", str(e), duration=4000)
             return
         self._set_processing(False)
         self.output_excel_paths = list(paths)
         self.progress_label.setText("导出完成")
         self._append_log(f"[完成] 生成 {len(self.output_excel_paths)} 个输出文件")
-        names = "\n".join([os.path.basename(p) for p in self.output_excel_paths[:8]])
-        if len(self.output_excel_paths) > 8:
-            names += f"\n... 共 {len(self.output_excel_paths)} 个"
-        QMessageBox.information(self, "导出完成", f"已导出。\n\n输出文件：\n{names}")
+        self._toast(
+            "success",
+            "导出完成",
+            f"已生成 {len(self.output_excel_paths)} 个文件，可点『打开输出』查看。",
+            duration=4000,
+        )
 
     def _on_worker_failed(self, msg: str):
         self._set_processing(False)
         self.progress_label.setText("处理失败")
         self._append_log(f"[失败] {msg}")
-        QMessageBox.critical(self, "处理失败", msg)
+        self._toast("error", "处理失败", msg, duration=4000)
         self._worker = None
 
     def _on_open_output(self):
         if not self.output_excel_paths:
-            QMessageBox.information(self, "提示", "尚未生成输出文件，请先完成识别。")
+            self._toast("info", "提示", "尚未生成输出文件，请先完成识别。")
             return
         try:
             if len(self.output_excel_paths) == 1:
@@ -443,6 +433,6 @@ class DocPageMixin:
             parent_dir = os.path.dirname(self.output_excel_paths[0])
             os.startfile(parent_dir)
             self._append_log(f"[打开目录] {parent_dir}")
-            QMessageBox.information(self, "已打开目录", "已为你打开输出目录。")
+            self._toast("info", "已打开目录", "已为你打开输出目录。")
         except Exception as e:
-            QMessageBox.critical(self, "打开失败", str(e))
+            self._toast("error", "打开失败", str(e))

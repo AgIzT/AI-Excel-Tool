@@ -91,6 +91,43 @@ def _build_client(api_config: ApiConfig):
     return OpenAI(api_key=key, base_url=base_url)
 
 
+# 连通性测试用的一张极小（32×32 纯白）PNG，base64 内联。
+# 真识别发的就是 image_url（base64 data url），这里用同样的形式探活，
+# 从而连「模型是否支持视觉输入」一起验掉，而不只是文本连通。
+_PING_IMAGE_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NMQ0AAAwDoPo3"
+    "3arYsQQMkB6LQCAQCAQCgUAg+BIMi1X0ptsIcT0AAAAASUVORK5CYII="
+)
+
+
+def test_connectivity(api_config: ApiConfig) -> str:
+    """
+    探活：用配置的 base_url / model / API Key 发一次最小**多模态**请求
+    （一句文本 + 一张极小测试图），一并验证「地址可达 + 鉴权通过 + 模型存在 +
+    模型确实支持视觉输入」。复用真实识别同一条客户端构建路径（含 API Key 的
+    环境变量兜底），所以测试通过基本等价于识别可用。
+    成功返回模型回显的简短文本；任何环节失败（含模型不支持图像）都会抛异常。
+    """
+    model = (api_config.model or EXTRACT_MODEL).strip()
+    client = _build_client(api_config)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "这是连通性测试，收到图片请回复 ok"},
+                {"type": "image_url", "image_url": {"url": _PING_IMAGE_DATA_URL}},
+            ],
+        }],
+        temperature=EXTRACT_TEMPERATURE,
+        max_tokens=16,
+        timeout=20,
+    )
+    content = (response.choices[0].message.content or "").strip()
+    return content or "(连接成功，但模型未返回文本)"
+
+
 # ─────────────────────────────────────────────
 # 模板表头
 # ─────────────────────────────────────────────

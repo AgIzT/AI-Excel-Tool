@@ -3,20 +3,7 @@ import os
 import sys
 from PySide6.QtCore import QDateTime, QSettings, QTimer, Qt
 from PySide6.QtGui import QPixmap, QSurfaceFormat, QTextCursor
-from PySide6.QtWidgets import (
-    QApplication,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QPushButton,
-    QSizePolicy,
-    QSpacerItem,
-    QStackedWidget,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _meipass = getattr(sys, "_MEIPASS", None)
@@ -24,13 +11,30 @@ for _p in filter(None, [_meipass, BASE_DIR]):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from theme import build_stylesheet
+from qfluentwidgets import (
+    FluentWindow,
+    FluentIcon,
+    InfoBar,
+    InfoBarPosition,
+    NavigationItemPosition,
+    SubtitleLabel,
+    TextEdit,
+    Theme,
+    setTheme,
+    setThemeColor,
+)
+
 from doc_page import DocPageMixin
 from settings_page import SettingsPageMixin
 from template_manager import TemplateManager
 
+# QSettings 中保存的界面主题键；与设置页的下拉一致
+THEME_KEY = "ui/theme"
+THEME_MAP = {"AUTO": Theme.AUTO, "LIGHT": Theme.LIGHT, "DARK": Theme.DARK}
+BRAND_COLOR = "#4f8ef7"
 
-class MainWindow(DocPageMixin, SettingsPageMixin, QMainWindow):
+
+class MainWindow(DocPageMixin, SettingsPageMixin, FluentWindow):
     def __init__(self):
         super().__init__()
         self.settings = QSettings("InvoiceAI", "InvoiceAIDesktop")
@@ -38,14 +42,9 @@ class MainWindow(DocPageMixin, SettingsPageMixin, QMainWindow):
         self.selected_files = []
         self._selected_file_set = set()
         self.output_excel_paths = []
-        self._active_route = ""
-        self._pages = {}
-        self._route_indexes = {}
-        self._nav_buttons = {}
         self._worker = None
         self._processing = False
         self._log_buffer = []
-        self._log_collapsed = True
         self._preview_path = ""
         self._preview_source = QPixmap()
 
@@ -59,159 +58,45 @@ class MainWindow(DocPageMixin, SettingsPageMixin, QMainWindow):
         self._resize_timer.setInterval(180)
         self._resize_timer.timeout.connect(self._on_resize_stable)
 
-        self._route_builders = {
-            "单据处理": self._build_doc_page,
-            "设置": self._build_setting_page,
-        }
-
         self._build_window()
-        self._build_layout()
-        self._apply_style()
-        self._switch_route("单据处理")
-        self._append_log("PySide6 阶段三已启动")
+        self._init_navigation()
+        self._append_log("PySide6 + QFluentWidgets 外壳已启动")
 
     def _build_window(self):
-        self.setWindowTitle("全自动单据入库系统 - PySide6")
+        self.setWindowTitle("全自动单据入库系统")
         self.resize(1360, 860)
         self.setMinimumSize(1080, 700)
 
-    def _build_layout(self):
-        root = QWidget(self)
-        self.setCentralWidget(root)
-        root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
+    def _init_navigation(self):
+        # FluentWindow 自带左侧导航 + 内容堆栈；每个子界面必须先设唯一 objectName
+        self.doc_interface = self._build_doc_page()
+        self.doc_interface.setObjectName("docInterface")
+        self.log_interface = self._build_log_page()
+        self.log_interface.setObjectName("logInterface")
+        self.settings_interface = self._build_setting_page()
+        self.settings_interface.setObjectName("settingsInterface")
 
-        content_wrap = QWidget(root)
-        content_layout = QHBoxLayout(content_wrap)
-        content_layout.setContentsMargins(12, 12, 12, 8)
-        content_layout.setSpacing(12)
-        root_layout.addWidget(content_wrap, 1)
+        self.addSubInterface(self.doc_interface, FluentIcon.DOCUMENT, "单据处理")
+        self.addSubInterface(
+            self.log_interface, FluentIcon.HISTORY, "运行日志", NavigationItemPosition.BOTTOM
+        )
+        self.addSubInterface(
+            self.settings_interface, FluentIcon.SETTING, "设置", NavigationItemPosition.BOTTOM
+        )
 
-        self.sidebar = QFrame(content_wrap)
-        self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(220)
-        sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(12, 12, 12, 12)
-        sidebar_layout.setSpacing(8)
-        content_layout.addWidget(self.sidebar, 0)
-
-        self._build_sidebar(sidebar_layout)
-
-        self.workspace = QWidget(content_wrap)
-        workspace_layout = QVBoxLayout(self.workspace)
-        workspace_layout.setContentsMargins(0, 0, 0, 0)
-        workspace_layout.setSpacing(10)
-        content_layout.addWidget(self.workspace, 1)
-
-        top_bar = QFrame(self.workspace)
-        top_bar.setObjectName("topBar")
-        top_bar.setFixedHeight(60)
-        top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(18, 8, 18, 8)
-        top_layout.setSpacing(8)
-        self.page_title = QLabel("单据处理", top_bar)
-        self.page_title.setObjectName("pageTitle")
-        top_layout.addWidget(self.page_title, 1)
-        self.window_size_label = QLabel("窗口: -", top_bar)
-        self.window_size_label.setObjectName("dimLabel")
-        top_layout.addWidget(self.window_size_label, 0, Qt.AlignmentFlag.AlignRight)
-        workspace_layout.addWidget(top_bar, 0)
-
-        self.page_stack = QStackedWidget(self.workspace)
-        self.page_stack.setObjectName("pageStack")
-        workspace_layout.addWidget(self.page_stack, 1)
-
-        self.log_drawer = QFrame(root)
-        self.log_drawer.setObjectName("logDrawer")
-        log_layout = QVBoxLayout(self.log_drawer)
-        log_layout.setContentsMargins(12, 8, 12, 12)
-        log_layout.setSpacing(6)
-        root_layout.addWidget(self.log_drawer, 0)
-
-        log_header = QWidget(self.log_drawer)
-        log_header_layout = QHBoxLayout(log_header)
-        log_header_layout.setContentsMargins(0, 0, 0, 0)
-        log_header_layout.setSpacing(8)
-        log_title = QLabel("实时日志", log_header)
-        log_title.setObjectName("sectionTitle")
-        log_header_layout.addWidget(log_title, 1)
-        self.log_toggle_btn = QPushButton("展开", log_header)
-        self.log_toggle_btn.setObjectName("logToggleButton")
-        self.log_toggle_btn.setFixedSize(76, 28)
-        self.log_toggle_btn.clicked.connect(self._toggle_log_drawer)
-        log_header_layout.addWidget(self.log_toggle_btn, 0, Qt.AlignmentFlag.AlignRight)
-        log_layout.addWidget(log_header, 0)
-
-        self.log_box = QTextEdit(self.log_drawer)
-        self.log_box.setObjectName("logBox")
+    def _build_log_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 18, 24, 22)
+        layout.setSpacing(12)
+        title = SubtitleLabel("运行日志", page)
+        layout.addWidget(title, 0)
+        self.log_box = TextEdit(page)
         self.log_box.setReadOnly(True)
-        self.log_box.setFixedHeight(190)
-        self.log_box.setVisible(False)
-        log_layout.addWidget(self.log_box, 0)
+        layout.addWidget(self.log_box, 1)
+        return page
 
-    def _build_sidebar(self, layout: QVBoxLayout):
-        brand = QFrame(self.sidebar)
-        brand.setObjectName("brandCard")
-        brand.setFixedHeight(72)
-        brand_layout = QVBoxLayout(brand)
-        brand_layout.setContentsMargins(12, 8, 12, 8)
-        brand_layout.setSpacing(0)
-        title = QLabel("Invoice AI", brand)
-        title.setObjectName("brandTitle")
-        subtitle = QLabel("PySide6 业务版", brand)
-        subtitle.setObjectName("dimLabel")
-        brand_layout.addWidget(title, 0)
-        brand_layout.addWidget(subtitle, 0)
-        layout.addWidget(brand, 0)
-
-        for route in ["单据处理", "设置"]:
-            btn = QPushButton(route, self.sidebar)
-            btn.setObjectName("navButton")
-            btn.setProperty("active", False)
-            btn.setFixedHeight(42)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda _=False, r=route: self._switch_route(r))
-            layout.addWidget(btn, 0)
-            self._nav_buttons[route] = btn
-
-        divider = QFrame(self.sidebar)
-        divider.setObjectName("divider")
-        divider.setFixedHeight(1)
-        layout.addWidget(divider, 0)
-        layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
-
-        self.sidebar_status = QLabel("状态：就绪", self.sidebar)
-        self.sidebar_status.setObjectName("dimLabel")
-        layout.addWidget(self.sidebar_status, 0)
-
-    def _switch_route(self, route: str):
-        if route == self._active_route:
-            return
-        self._active_route = route
-        self.page_title.setText(route)
-        self.sidebar_status.setText(f"状态：{route}")
-
-        for name, btn in self._nav_buttons.items():
-            active = name == route
-            btn.setProperty("active", active)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-
-        if route not in self._pages:
-            page = self._route_builders[route]()
-            idx = self.page_stack.addWidget(page)
-            self._pages[route] = page
-            self._route_indexes[route] = idx
-
-        self.page_stack.setCurrentIndex(self._route_indexes[route])
-        self._append_log(f"路由切换 -> {route}")
-
-    def _toggle_log_drawer(self):
-        self._log_collapsed = not self._log_collapsed
-        self.log_box.setVisible(not self._log_collapsed)
-        self.log_toggle_btn.setText("展开" if self._log_collapsed else "收起")
-
+    # ---- 日志 ----
     def _append_log(self, message: str):
         ts = QDateTime.currentDateTime().toString("HH:mm:ss")
         self._log_buffer.append(f"[{ts}] {message}")
@@ -226,16 +111,33 @@ class MainWindow(DocPageMixin, SettingsPageMixin, QMainWindow):
         self.log_box.insertPlainText(chunk)
         self.log_box.moveCursor(QTextCursor.MoveOperation.End)
 
+    # ---- 浮层提示 ----
+    def _toast(self, kind: str, title: str, content: str = "", duration: int = 3000):
+        fn = {
+            "success": InfoBar.success,
+            "error": InfoBar.error,
+            "warning": InfoBar.warning,
+            "info": InfoBar.info,
+        }.get(kind, InfoBar.info)
+        fn(
+            title=title,
+            content=content,
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=duration,
+            parent=self,
+        )
+
+    # ---- 预览随窗口大小重渲染 ----
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._resize_timer.start()
+        # FluentWindow 初始化期间可能触发 resize，此时计时器尚未就绪
+        if getattr(self, "_resize_timer", None) is not None:
+            self._resize_timer.start()
 
     def _on_resize_stable(self):
-        self.window_size_label.setText(f"窗口: {self.width()} × {self.height()}")
         self._render_preview()
-
-    def _apply_style(self):
-        self.setStyleSheet(build_stylesheet())
 
 
 def _configure_qt_acceleration():
@@ -249,10 +151,20 @@ def _configure_qt_acceleration():
     QSurfaceFormat.setDefaultFormat(fmt)
 
 
+def _apply_saved_theme():
+    settings = QSettings("InvoiceAI", "InvoiceAIDesktop")
+    name = str(settings.value(THEME_KEY, "AUTO", str) or "AUTO").upper()
+    setTheme(THEME_MAP.get(name, Theme.AUTO))
+
+
 def main():
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     _configure_qt_acceleration()
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    setThemeColor(BRAND_COLOR)
+    _apply_saved_theme()
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

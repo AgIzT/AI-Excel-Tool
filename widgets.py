@@ -7,10 +7,11 @@ widgets.py
 import os
 
 from PySide6.QtCore import QMimeData, Signal
-from PySide6.QtWidgets import QListWidget
+
+from qfluentwidgets import ListWidget
 
 
-class FileDropListWidget(QListWidget):
+class FileDropListWidget(ListWidget):
     files_dropped = Signal(list)
 
     def __init__(self, parent=None):
@@ -18,7 +19,7 @@ class FileDropListWidget(QListWidget):
         self.setAcceptDrops(True)
         self.setDragEnabled(False)
         self.setAlternatingRowColors(False)
-        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setSelectionMode(ListWidget.SelectionMode.SingleSelection)
 
     def dragEnterEvent(self, event):
         if self._has_urls(event.mimeData()):

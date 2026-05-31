@@ -11,26 +11,33 @@ review_dialog.py
         export_batch(edited, ...)
 """
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QDialog,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
-    QLineEdit,
-    QMessageBox,
-    QPushButton,
     QSizePolicy,
     QSpacerItem,
     QStackedWidget,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from theme import build_stylesheet
+from qfluentwidgets import (
+    BodyLabel,
+    CaptionLabel,
+    ComboBox,
+    InfoBar,
+    InfoBarPosition,
+    LineEdit,
+    PrimaryPushButton,
+    PushButton,
+    SubtitleLabel,
+    TableWidget,
+    isDarkTheme,
+)
 
 
 class ReviewDialog(QDialog):
@@ -47,24 +54,28 @@ class ReviewDialog(QDialog):
         self._supplier_edits = []
         self._date_edits = []
 
+        self.setObjectName("reviewDialog")
         self.setWindowTitle("导出前复核")
         self.setMinimumSize(900, 600)
-        self.setStyleSheet(build_stylesheet())
+        self._apply_theme_background()
         self._build_ui()
+
+    def _apply_theme_background(self):
+        # QDialog 不是 Fluent 窗口，不会自动跟随主题；按当前主题手动着色底板。
+        bg = "#202020" if isDarkTheme() else "#f3f3f3"
+        self.setStyleSheet(f"QDialog#reviewDialog {{ background-color: {bg}; }}")
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        title = QLabel("请核对识别结果，确认无误后再导出", self)
-        title.setObjectName("sectionTitle")
+        title = SubtitleLabel("请核对识别结果，确认无误后再导出", self)
         layout.addWidget(title, 0)
 
         if self._failed:
             names = "、".join(n for n, _ in self._failed)
-            warn = QLabel(f"⚠ {len(self._failed)} 个文件识别失败，不会导出：{names}", self)
-            warn.setObjectName("dimLabel")
+            warn = CaptionLabel(f"⚠ {len(self._failed)} 个文件识别失败，不会导出：{names}", self)
             warn.setWordWrap(True)
             layout.addWidget(warn, 0)
 
@@ -72,10 +83,8 @@ class ReviewDialog(QDialog):
         switch_layout = QHBoxLayout(switch_row)
         switch_layout.setContentsMargins(0, 0, 0, 0)
         switch_layout.setSpacing(8)
-        switch_label = QLabel("当前文件", switch_row)
-        switch_label.setObjectName("dimLabel")
-        self.file_combo = QComboBox(switch_row)
-        self.file_combo.setObjectName("comboBox")
+        switch_label = BodyLabel("当前文件", switch_row)
+        self.file_combo = ComboBox(switch_row)
         for it in self._items:
             self.file_combo.addItem(f"{it.get('name', '(未命名)')}（{len(it.get('records', []))} 条）")
         self.file_combo.currentIndexChanged.connect(self._on_file_changed)
@@ -90,8 +99,7 @@ class ReviewDialog(QDialog):
             self.stack.addWidget(self._build_item_page(it))
 
         if not self._items:
-            empty = QLabel("没有可复核的记录（全部文件识别失败）。", self)
-            empty.setObjectName("dimLabel")
+            empty = BodyLabel("没有可复核的记录（全部文件识别失败）。", self)
             self.stack.addWidget(empty)
 
         btn_row = QWidget(self)
@@ -99,11 +107,9 @@ class ReviewDialog(QDialog):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(8)
         btn_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
-        cancel_btn = QPushButton("取消", btn_row)
-        cancel_btn.setObjectName("secondaryButton")
+        cancel_btn = PushButton("取消", btn_row)
         cancel_btn.clicked.connect(self.reject)
-        self.export_btn = QPushButton("✅ 确认导出", btn_row)
-        self.export_btn.setObjectName("accentButton")
+        self.export_btn = PrimaryPushButton("确认导出", btn_row)
         self.export_btn.clicked.connect(self._on_confirm)
         self.export_btn.setEnabled(bool(self._items))
         btn_layout.addWidget(cancel_btn, 0)
@@ -121,12 +127,12 @@ class ReviewDialog(QDialog):
         meta_layout = QHBoxLayout(meta_row)
         meta_layout.setContentsMargins(0, 0, 0, 0)
         meta_layout.setSpacing(8)
-        sup_label = QLabel("供应商", meta_row)
-        sup_label.setObjectName("dimLabel")
-        sup_edit = QLineEdit(str(meta.get("supplier", "") or ""), meta_row)
-        date_label = QLabel("日期", meta_row)
-        date_label.setObjectName("dimLabel")
-        date_edit = QLineEdit(str(meta.get("date", "") or ""), meta_row)
+        sup_label = BodyLabel("供应商", meta_row)
+        sup_edit = LineEdit(meta_row)
+        sup_edit.setText(str(meta.get("supplier", "") or ""))
+        date_label = BodyLabel("日期", meta_row)
+        date_edit = LineEdit(meta_row)
+        date_edit.setText(str(meta.get("date", "") or ""))
         meta_layout.addWidget(sup_label, 0)
         meta_layout.addWidget(sup_edit, 2)
         meta_layout.addWidget(date_label, 0)
@@ -135,7 +141,11 @@ class ReviewDialog(QDialog):
         self._supplier_edits.append(sup_edit)
         self._date_edits.append(date_edit)
 
-        table = QTableWidget(page)
+        table = TableWidget(page)
+        if hasattr(table, "setBorderRadius"):
+            table.setBorderRadius(8)
+        if hasattr(table, "setBorderVisible"):
+            table.setBorderVisible(True)
         records = item.get("records", []) or []
         table.setColumnCount(len(self._headers))
         table.setHorizontalHeaderLabels(self._headers)
@@ -156,11 +166,9 @@ class ReviewDialog(QDialog):
         tool_layout = QHBoxLayout(tool_row)
         tool_layout.setContentsMargins(0, 0, 0, 0)
         tool_layout.setSpacing(8)
-        add_btn = QPushButton("＋ 增加行", tool_row)
-        add_btn.setObjectName("secondaryButton")
+        add_btn = PushButton("增加行", tool_row)
         add_btn.clicked.connect(lambda _=False, t=table: self._add_row(t))
-        del_btn = QPushButton("✕ 删除选中行", tool_row)
-        del_btn.setObjectName("secondaryButton")
+        del_btn = PushButton("删除选中行", tool_row)
         del_btn.clicked.connect(lambda _=False, t=table: self._del_rows(t))
         tool_layout.addWidget(add_btn, 0)
         tool_layout.addWidget(del_btn, 0)
@@ -173,7 +181,7 @@ class ReviewDialog(QDialog):
         if 0 <= idx < self.stack.count():
             self.stack.setCurrentIndex(idx)
 
-    def _add_row(self, table: QTableWidget):
+    def _add_row(self, table: TableWidget):
         r = table.rowCount()
         table.insertRow(r)
         for c in range(table.columnCount()):
@@ -181,7 +189,7 @@ class ReviewDialog(QDialog):
         table.scrollToBottom()
         table.setCurrentCell(r, 0)
 
-    def _del_rows(self, table: QTableWidget):
+    def _del_rows(self, table: TableWidget):
         rows = sorted({i.row() for i in table.selectedIndexes()}, reverse=True)
         if not rows:
             cur = table.currentRow()
@@ -190,7 +198,7 @@ class ReviewDialog(QDialog):
         for r in rows:
             table.removeRow(r)
 
-    def _read_table(self, table: QTableWidget) -> list:
+    def _read_table(self, table: TableWidget) -> list:
         records = []
         for r in range(table.rowCount()):
             rec = {}
@@ -225,6 +233,14 @@ class ReviewDialog(QDialog):
     def _on_confirm(self):
         total = sum(len(self._read_table(t)) for t in self._tables)
         if total == 0:
-            QMessageBox.warning(self, "无可导出数据", "当前没有任何记录，请先补充或点击取消。")
+            InfoBar.warning(
+                title="无可导出数据",
+                content="当前没有任何记录，请先补充或点击取消。",
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+                parent=self,
+            )
             return
         self.accept()

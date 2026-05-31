@@ -7,7 +7,7 @@ workers.py
 
 from PySide6.QtCore import QThread, Signal
 
-from ocr_to_excel import extract_batch
+from ocr_to_excel import extract_batch, test_connectivity
 
 
 class ExtractWorker(QThread):
@@ -42,3 +42,21 @@ class ExtractWorker(QThread):
             self.extract_finished.emit(extraction)
         except Exception as e:
             self.task_failed.emit(str(e))
+
+
+class ConnectivityWorker(QThread):
+    """设置页「测试连通性」：后台发一次最小请求，避免网络等待卡住 UI。"""
+
+    finished_ok = Signal(str)    # 成功，带模型回显文本
+    finished_err = Signal(str)   # 失败，带错误信息
+
+    def __init__(self, api_config):
+        super().__init__()
+        self._api_config = api_config
+
+    def run(self):
+        try:
+            reply = test_connectivity(self._api_config)
+            self.finished_ok.emit(reply)
+        except Exception as e:
+            self.finished_err.emit(str(e))

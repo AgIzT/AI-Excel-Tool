@@ -2,6 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![PySide6](https://img.shields.io/badge/Framework-PySide6-green.svg)
+![QFluentWidgets](https://img.shields.io/badge/UI-QFluentWidgets-4f8ef7.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 > 解决手工录单转自动化。多张单据一键拖入，AI 自动提取信息并匹配导出自定义模板 Excel；导出前可人工复核，确保数据准确。
@@ -13,6 +14,7 @@
 * **接口可自定义**：内置「智谱 GLM / OpenAI / 通义千问 / 自定义」预设，任何 OpenAI 兼容的多模态模型都能用。
 * **导出前人工复核**：识别后先在可编辑表格中核对、修改，确认无误再导出——数据要进会计软件，准确性第一。
 * **批量与模板**：多文件拖拽、手写体识别增强、合并输出、智能文件命名、内置与自定义 Excel 模板。
+* **Fluent 现代界面**：基于 QFluentWidgets 的 Win11 风格外壳，支持浅色 / 深色 / 跟随系统主题切换，关键节点用 InfoBar 浮层提示，运行日志独立成页。
 
 
 ## 🛠️ 快速上手
@@ -25,7 +27,7 @@
 1.  选择 **接口预设**（智谱 GLM / OpenAI / 通义千问 / 自定义），会自动填入接口地址与模型，也可手动修改。
 2.  填写对应平台的 **API Key**，点击保存。
 
-> 任何 OpenAI 兼容的多模态（视觉）模型均可使用。
+> 任何 OpenAI 兼容的多模态（视觉）模型均可使用。在「设置」页底部还可切换 **界面主题**（跟随系统 / 浅色 / 深色）。
 
 ### 3. 录入
 1.  切换至 **“单据处理”** 页面。
