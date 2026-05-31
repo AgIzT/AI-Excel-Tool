@@ -11,6 +11,8 @@ env/
 build/
 dist/
 *.spec
+# 但 InvoiceAI.spec 是手工维护的打包配方(含 collect_all 收 Fluent 资源),需纳入版本管理
+!InvoiceAI.spec
 
 # 运行时生成的本地配置（含本机绝对路径，勿提交）
 user_templates.json
