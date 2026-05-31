@@ -18,7 +18,7 @@
 ## 🛠️ 快速上手
 
 ### 1. 下载
-前往 [Releases](https://github.com/AgIzT/AI-Excel-Tool/releases) 页面下载最新的 `default.exe`。
+前往 [Releases](https://github.com/AgIzT/AI-Excel-Tool/releases) 页面下载最新的 `InvoiceAI.exe`。
 
 ### 2. 配置
 首次启动请进入左侧 **“设置”** 页面：
